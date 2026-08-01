@@ -53,13 +53,14 @@ class WisenetWaveApiClient:
         if not await self.async_login():
             return False
             
-        url = f"{self.base_url}/rest/v4/system/info"
+        # WIR ÄNDERN HIER DEN ENDPUNKT VON system/info ZU devices
+        url = f"{self.base_url}/rest/v4/devices"
         headers = await self._get_headers()
         try:
             async with self.session.get(url, headers=headers, timeout=10, ssl=False) as response:
                 if response.status == 200:
                     return True
-                _LOGGER.error("System info request failed with status: %s", response.status)
+                _LOGGER.error("Connection test failed with status: %s", response.status)
                 return False
         except Exception as err:
             _LOGGER.error("Unexpected error connecting to Wisenet WAVE: %s", err)
