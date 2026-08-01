@@ -76,10 +76,7 @@ class WisenetWaveApiClient:
 
     async def async_send_webrtc_offer(self, camera_id: str, offer_sdp: str) -> str | None:
         """Send WebRTC SDP offer to Wisenet WAVE API and return SDP answer."""
-        # stream=0 fordert den nativen Hauptstream an, statt dass der Server
-        # entweder auf den Sekundärstream ausweicht oder (bei "resolution=..")
-        # unnötiges Transcoding anstößt, das schwächere Server ins Stocken bringt.
-        url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc?stream=0"
+        url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc"
         payload = {"sdp": offer_sdp}
 
         for attempt in range(2):
@@ -97,7 +94,12 @@ class WisenetWaveApiClient:
                         _LOGGER.debug("Wisenet WebRTC token expired, re-authenticating")
                         self._token = None
                         continue
-                    _LOGGER.error("Wisenet WebRTC SDP exchange failed with status %s", response.status)
+                    body = await response.text()
+                    _LOGGER.error(
+                        "Wisenet WebRTC SDP exchange failed with status %s: %s",
+                        response.status,
+                        body[:500],
+                    )
                     return None
             except Exception as err:
                 _LOGGER.error("Error exchanging WebRTC offer with Wisenet WAVE: %s", err)
