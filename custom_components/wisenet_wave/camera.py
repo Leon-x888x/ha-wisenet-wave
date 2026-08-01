@@ -1,9 +1,11 @@
 """Camera platform for Wisenet WAVE with native WebRTC support."""
 import urllib.parse
 import logging
+import json
+import aiohttp
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.components.camera.webrtc import WebRTCAnswer, WebRTCError, WebRTCSendMessage
+from homeassistant.components.camera.webrtc import WebRTCAnswer, WebRTCError, WebRTCSendMessage, WebRTCCandidate
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
@@ -21,8 +23,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # Home Assistant erlaubt pro Kamera-Entität entweder natives WebRTC ODER den
     # RTSP/HLS-Weg (stream_source) - nicht beides gemischt in einer Klasse. Deshalb
     # wird hier je nach gewählter Option die passende Kamera-Klasse instanziiert.
-    # Ein Options-Wechsel löst bereits einen vollständigen Reload aus (siehe
-    # __init__.py: update_listener), die Entitäten werden also korrekt neu erstellt.
     stream_type = entry.options.get(CONF_STREAM_TYPE, STREAM_TYPE_RTSP)
     camera_cls = WisenetWaveWebRTCCamera if stream_type == STREAM_TYPE_WEBRTC else WisenetWaveRTSPCamera
 
@@ -77,41 +77,101 @@ class WisenetWaveRTSPCamera(WisenetWaveCameraBase):
         "async_stream_source"), sonst erkennt Home Assistants Camera-Basisklasse
         die Überschreibung nicht und liefert immer None zurück!
         """
-        # stream=0 fordert den nativen Hauptstream (hohe Qualität) an, OHNE
-        # serverseitiges Transcoding zu erzwingen (das "resolution"-Param tut das
-        # und überlastet schwächere WAVE-Server, was zu Rucklern führt).
+        # stream=primary fordert den nativen Hauptstream (hohe Qualität) an.
         safe_password = urllib.parse.quote(self.client.password)
-        return f"rtsp://{self.client.username}:{safe_password}@{self.client.host}:{self.client.port}/{self._cam_id}?stream=0"
+        return f"rtsp://{self.client.username}:{safe_password}@{self.client.host}:{self.client.port}/{self._cam_id}?stream=primary"
 
 
 class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
-    """Native-WebRTC-Variante (aktuelle Home-Assistant-API, ersetzt async_handle_web_rtc_offer)."""
+    """Native-WebRTC-Variante über V4 WebSocket Signalisierung."""
+
+    def __init__(self, client, camera_info, entry: ConfigEntry):
+        super().__init__(client, camera_info, entry)
+        # Session_id als Key, WebSocket-Verbindung als Value
+        self._active_sessions: dict[str, aiohttp.ClientWebSocketResponse] = {}
 
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
     ) -> None:
-        """Handle the async WebRTC offer by forwarding it to the Wisenet WAVE server."""
-        answer_sdp = await self.client.async_send_webrtc_offer(self._cam_id, offer_sdp)
-        if answer_sdp:
-            send_message(WebRTCAnswer(answer_sdp))
-        else:
-            _LOGGER.error("Wisenet WAVE returned no WebRTC answer for camera %s", self._cam_id)
-            send_message(
-                WebRTCError(
-                    "wisenet_wave_webrtc_failed",
-                    "Wisenet WAVE server did not return a WebRTC answer",
-                )
-            )
+        """Handle the async WebRTC offer by sending it over a new WebSocket connection."""
+        
+        # 1. Open the WebSocket specifically for this stream
+        ws = await self.client.async_get_webrtc_websocket(self._cam_id, stream="primary")
+        if not ws:
+            _LOGGER.error("Failed to open WebRTC WebSocket for camera %s", self._cam_id)
+            send_message(WebRTCError("connection_failed", "Wisenet WAVE WebRTC WS connection failed"))
+            return
+
+        self._active_sessions[session_id] = ws
+
+        # 2. Send the SDP Offer via JSON
+        offer_payload = {
+            "type": "offer",
+            "sdp": offer_sdp
+        }
+        await ws.send_json(offer_payload)
+
+        # 3. Start a background task to listen for the Answer and ICE candidates
+        self.hass.async_create_task(self._listen_to_webrtc_websocket(session_id, ws, send_message))
+
+    async def _listen_to_webrtc_websocket(
+        self, session_id: str, ws: aiohttp.ClientWebSocketResponse, send_message: WebRTCSendMessage
+    ) -> None:
+        """Listen to incoming messages (Answer, Candidates) from the WAVE server."""
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        msg_type = data.get("type")
+
+                        if msg_type == "answer" and "sdp" in data:
+                            send_message(WebRTCAnswer(data["sdp"]))
+                        
+                        elif msg_type == "candidate" and "candidate" in data:
+                            # Forward ICE candidates from Server to Home Assistant / Browser
+                            # WebRTCCandidate signature requires checking if sdpMid/sdpMLineIndex are passed
+                            send_message(
+                                WebRTCCandidate(
+                                    data["candidate"],
+                                    data.get("sdpMLineIndex"),
+                                    data.get("sdpMid")
+                                )
+                            )
+                        elif msg_type == "error":
+                            _LOGGER.error("WebRTC Server Error for %s: %s", self._cam_id, data)
+                            send_message(WebRTCError("webrtc_error", str(data.get("error", "Unknown error"))))
+                            
+                    except json.JSONDecodeError:
+                        _LOGGER.debug("Received non-JSON message on WebRTC WS for %s", self._cam_id)
+
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    _LOGGER.debug("WebRTC WS closed/error for camera %s", self._cam_id)
+                    break
+        except Exception as err:
+            _LOGGER.error("Exception in WebRTC WS listener for camera %s: %s", self._cam_id, err)
+        finally:
+            self.close_webrtc_session(session_id)
 
     async def async_on_webrtc_candidate(self, session_id: str, candidate) -> None:
-        """Handle a WebRTC candidate from the frontend.
-
-        Der WAVE-Server tauscht SDP Offer/Answer in einem einzigen REST-Aufruf aus
-        (non-trickle ICE) - es gibt daher keine einzeln nachzureichenden Candidates.
-        """
-        return
+        """Handle a WebRTC candidate from the HA frontend and send it to WAVE."""
+        ws = self._active_sessions.get(session_id)
+        if ws and not ws.closed:
+            payload = {
+                "type": "candidate",
+                "candidate": candidate.candidate,
+                "sdpMLineIndex": candidate.sdpMLineIndex,
+                "sdpMid": candidate.sdpMid
+            }
+            try:
+                await ws.send_json(payload)
+            except Exception as err:
+                _LOGGER.warning("Failed to send ICE candidate to WAVE for %s: %s", self._cam_id, err)
 
     @callback
     def close_webrtc_session(self, session_id: str) -> None:
-        """Clean up when the frontend closes the WebRTC session."""
-        return
+        """Clean up when the frontend closes the WebRTC session or connection drops."""
+        ws = self._active_sessions.pop(session_id, None)
+        if ws and not ws.closed:
+            # We schedule the closing so we don't block the callback
+            self.hass.async_create_task(ws.close())
