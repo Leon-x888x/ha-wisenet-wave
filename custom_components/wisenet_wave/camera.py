@@ -65,6 +65,22 @@ def _sdp_with_mid(block: list[str], new_mid: str) -> list[str]:
     return out
 
 
+def _sdp_fix_setup_for_answer(block: list[str]) -> list[str]:
+    """An SDP answer's a=setup must be 'active' or 'passive', never 'actpass'
+    (that's only legal in an offer). Wisenet WAVE always emits 'actpass'
+    since it builds its SDP the same way regardless of role. Since WAVE
+    declares itself ice-lite (the passive/server side), we pin it to
+    'passive' so the browser (active) initiates the DTLS handshake.
+    """
+    out = []
+    for line in block:
+        if line.strip() == "a=setup:actpass":
+            out.append("a=setup:passive")
+        else:
+            out.append(line)
+    return out
+
+
 def _sdp_rejected_block(media_type: str, mid: str) -> list[str]:
     proto = "UDP/TLS/RTP/SAVPF" if media_type in ("video", "audio") else "UDP/DTLS/SCTP"
     fmt = "0" if media_type in ("video", "audio") else "webrtc-datachannel"
@@ -104,6 +120,7 @@ def _align_answer_to_offer(offer_sdp: str, answer_sdp: str) -> str:
                 mid_val = offer_mid if offer_mid is not None else _sdp_mid(chosen)
                 if offer_mid is not None:
                     chosen = _sdp_with_mid(chosen, offer_mid)
+                chosen = _sdp_fix_setup_for_answer(chosen)
                 aligned_blocks.append(chosen)
             else:
                 mid_val = offer_mid if offer_mid is not None else str(len(aligned_blocks))
