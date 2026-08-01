@@ -76,20 +76,27 @@ class WisenetWaveApiClient:
 
     async def async_send_webrtc_offer(self, camera_id: str, offer_sdp: str) -> str | None:
         """Send WebRTC SDP offer to Wisenet WAVE API and return SDP answer."""
-        headers = await self._get_headers()
-        if not headers:
-            return None
-
         url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc"
         payload = {"sdp": offer_sdp}
 
-        try:
-            async with self.session.post(url, json=payload, headers=headers, timeout=10, ssl=False) as response:
-                if response.status in (200, 201):
-                    data = await response.json()
-                    return data.get("sdp")
-                _LOGGER.error("Wisenet WebRTC SDP exchange failed with status %s", response.status)
+        for attempt in range(2):
+            headers = await self._get_headers()
+            if not headers:
                 return None
-        except Exception as err:
-            _LOGGER.error("Error exchanging WebRTC offer with Wisenet WAVE: %s", err)
-            return None
+
+            try:
+                async with self.session.post(url, json=payload, headers=headers, timeout=10, ssl=False) as response:
+                    if response.status in (200, 201):
+                        data = await response.json()
+                        return data.get("sdp")
+                    if response.status == 401 and attempt == 0:
+                        # Token abgelaufen -> einmal neu einloggen und erneut versuchen
+                        _LOGGER.debug("Wisenet WebRTC token expired, re-authenticating")
+                        self._token = None
+                        continue
+                    _LOGGER.error("Wisenet WebRTC SDP exchange failed with status %s", response.status)
+                    return None
+            except Exception as err:
+                _LOGGER.error("Error exchanging WebRTC offer with Wisenet WAVE: %s", err)
+                return None
+        return None
