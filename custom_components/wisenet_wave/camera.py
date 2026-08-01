@@ -113,9 +113,13 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
         self._answered_sessions[session_id] = False
 
         # 2. Send the SDP Offer via JSON
+        # WICHTIG: Wisenet WAVE erwartet SDP-Nachrichten NICHT flach als
+        # {"type": ..., "sdp": ...}, sondern verpackt unter dem Key "sdp".
         offer_payload = {
-            "type": "offer",
-            "sdp": offer_sdp
+            "sdp": {
+                "type": "offer",
+                "sdp": offer_sdp
+            }
         }
         _LOGGER.debug("Sending WebRTC offer to WAVE for camera %s (session %s)", self._cam_id, session_id)
         await ws.send_json(offer_payload)
@@ -159,16 +163,39 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                     _LOGGER.debug("WebRTC WS message for camera %s: %s", self._cam_id, msg.data)
                     try:
                         data = json.loads(msg.data)
-                        msg_type = data.get("type")
 
-                        if msg_type == "answer" and "sdp" in data:
+                        # Wisenet WAVE verpackt SDP unter "sdp" und ICE-Candidates
+                        # unter "ice" (statt eines flachen {"type": ...} Objekts).
+                        # WAVE labelt seine eigene SDP dabei intern immer als
+                        # "offer" - inhaltlich ist es aber die Antwort auf unseren
+                        # Browser-Offer (sendonly passend zu recvonly), daher wird
+                        # der reine SDP-Text unabhängig vom "type"-Feld weitergegeben.
+                        sdp_wrapper = data.get("sdp")
+                        ice_wrapper = data.get("ice")
+
+                        if isinstance(sdp_wrapper, dict) and "sdp" in sdp_wrapper:
+                            got_answer = True
+                            self._answered_sessions[session_id] = True
+                            send_message(WebRTCAnswer(sdp_wrapper["sdp"]))
+
+                        elif isinstance(ice_wrapper, dict) and "candidate" in ice_wrapper:
+                            sdp_mid = ice_wrapper.get("sdpMid")
+                            send_message(
+                                WebRTCCandidate(
+                                    ice_wrapper["candidate"],
+                                    ice_wrapper.get("sdpMLineIndex"),
+                                    str(sdp_mid) if sdp_mid is not None else None,
+                                )
+                            )
+
+                        # Fallback: falls doch mal das flache Format kommt (z.B.
+                        # ältere WAVE-Version oder andere Endpunkte).
+                        elif data.get("type") == "answer" and "sdp" in data:
                             got_answer = True
                             self._answered_sessions[session_id] = True
                             send_message(WebRTCAnswer(data["sdp"]))
-                        
-                        elif msg_type == "candidate" and "candidate" in data:
-                            # Forward ICE candidates from Server to Home Assistant / Browser
-                            # WebRTCCandidate signature requires checking if sdpMid/sdpMLineIndex are passed
+
+                        elif data.get("type") == "candidate" and "candidate" in data:
                             send_message(
                                 WebRTCCandidate(
                                     data["candidate"],
@@ -176,10 +203,11 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                                     data.get("sdpMid")
                                 )
                             )
-                        elif msg_type == "error":
+
+                        elif data.get("type") == "error" or "error" in data:
                             _LOGGER.error("WebRTC Server Error for %s: %s", self._cam_id, data)
                             send_message(WebRTCError("webrtc_error", str(data.get("error", "Unknown error"))))
-                            
+
                     except json.JSONDecodeError:
                         _LOGGER.debug("Received non-JSON message on WebRTC WS for %s", self._cam_id)
 
@@ -212,10 +240,11 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                 sdp_mid = getattr(candidate, "sdpMid", None)
 
             payload = {
-                "type": "candidate",
-                "candidate": candidate.candidate,
-                "sdpMLineIndex": sdp_m_line_index,
-                "sdpMid": sdp_mid
+                "ice": {
+                    "candidate": candidate.candidate,
+                    "sdpMLineIndex": sdp_m_line_index,
+                    "sdpMid": sdp_mid
+                }
             }
             try:
                 await ws.send_json(payload)
