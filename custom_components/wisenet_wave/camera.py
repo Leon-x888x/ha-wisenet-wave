@@ -1,0 +1,52 @@
+"""Camera platform for Wisenet WAVE."""
+import aiohttp
+from homeassistant.components.camera import Camera
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import DeviceInfo
+
+from .const import DOMAIN
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+    """Set up camera entities from Wisenet WAVE API."""
+    client = hass.data[DOMAIN][entry.entry_id]
+    raw_cameras = await client.async_get_cameras()
+
+    entities = []
+    for cam in raw_cameras:
+        entities.append(WisenetWaveCamera(client, cam))
+
+    async_add_entities(entities)
+
+class WisenetWaveCamera(Camera):
+    """Representation of a Wisenet WAVE camera."""
+
+    def __init__(self, client, camera_info):
+        super().__init__()
+        self.client = client
+        self.cam_info = camera_info
+        self._cam_id = camera_info.get("id")
+        self._attr_name = camera_info.get("name", "Wisenet Camera")
+        self._attr_unique_id = f"wisenet_wave_{self._cam_id}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Connects entity to Home Assistant Device Registry for room assignment."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._cam_id)},
+            name=self._attr_name,
+            manufacturer=self.cam_info.get("vendor", "Hanwha / Wisenet"),
+            model=self.cam_info.get("model", "WAVE Camera"),
+        )
+
+    async def async_camera_image(self, width=None, height=None) -> bytes | None:
+        """Fetch thumbnail snapshot from camera via WAVE API."""
+        url = f"{self.client.base_url}/ec2/cameraThumbnail?cameraId={self._cam_id}"
+        auth = aiohttp.BasicAuth(self.client.username, self.client.password)
+        try:
+            async with self.client.session.get(url, auth=auth, timeout=5) as response:
+                if response.status == 200:
+                    return await response.read()
+        except Exception:
+            return None
+        return None

@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Wisenet WAVE Verbindung",
+        "description": "Gib die Zugangsdaten deines Wisenet WAVE Servers ein.",
+        "data": {
+          "host": "IP-Adresse",
+          "port": "Port",
+          "username": "Benutzername",
+          "password": "Passwort"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Verbindung zum Wisenet WAVE Server fehlgeschlagen. Bitte IP und Passwort prüfen."
+    }
+  }
+}

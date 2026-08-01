@@ -1,0 +1,10 @@
+{
+  "domain": "wisenet_wave",
+  "name": "Wisenet WAVE",
+  "codeowners": ["@Leon-x888x"],
+  "config_flow": true,
+  "documentation": "https://github.com/Leon-x888x/ha-wisenet-wave",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Leon-x888x/ha-wisenet-wave/issues",
+  "version": "0.1.0"
+}
