@@ -20,6 +20,112 @@ _LOGGER = logging.getLogger(__name__)
 WEBRTC_ANSWER_TIMEOUT = 8
 
 
+def _sdp_parse_sections(sdp: str) -> tuple[list[str], list[list[str]]]:
+    """Split an SDP string into (session-level lines, list of m= blocks)."""
+    lines = sdp.replace("\r\n", "\n").split("\n")
+    session_lines: list[str] = []
+    m_blocks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines:
+        if line.startswith("m="):
+            if current is not None:
+                m_blocks.append(current)
+            current = [line]
+        elif current is not None:
+            current.append(line)
+        else:
+            session_lines.append(line)
+    if current is not None:
+        m_blocks.append(current)
+    return session_lines, m_blocks
+
+
+def _sdp_media_type(block: list[str]) -> str:
+    return block[0][2:].split(" ", 1)[0]
+
+
+def _sdp_mid(block: list[str]) -> str | None:
+    for line in block:
+        if line.startswith("a=mid:"):
+            return line[len("a=mid:"):].strip()
+    return None
+
+
+def _sdp_with_mid(block: list[str], new_mid: str) -> list[str]:
+    out = []
+    replaced = False
+    for line in block:
+        if line.startswith("a=mid:"):
+            out.append(f"a=mid:{new_mid}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"a=mid:{new_mid}")
+    return out
+
+
+def _sdp_rejected_block(media_type: str, mid: str) -> list[str]:
+    proto = "UDP/TLS/RTP/SAVPF" if media_type in ("video", "audio") else "UDP/DTLS/SCTP"
+    fmt = "0" if media_type in ("video", "audio") else "webrtc-datachannel"
+    return [
+        f"m={media_type} 0 {proto} {fmt}",
+        "c=IN IP4 0.0.0.0",
+        f"a=mid:{mid}",
+        "a=inactive",
+    ]
+
+
+def _align_answer_to_offer(offer_sdp: str, answer_sdp: str) -> str:
+    """Reorder/filter the m= sections of `answer_sdp` to exactly match the
+    count, order and mid values of `offer_sdp`'s m= sections.
+
+    Wisenet WAVE builds its SDP independently of the offer it receives
+    (e.g. it always includes a datachannel m-line even if the browser never
+    asked for one), which browsers reject with "order of m-lines in answer
+    doesn't match order in offer". This rebuilds a spec-compliant answer.
+    """
+    try:
+        _, offer_blocks = _sdp_parse_sections(offer_sdp)
+        answer_session, answer_blocks = _sdp_parse_sections(answer_sdp)
+
+        remaining_by_type: dict[str, list[list[str]]] = {}
+        for block in answer_blocks:
+            remaining_by_type.setdefault(_sdp_media_type(block), []).append(block)
+
+        aligned_blocks: list[list[str]] = []
+        used_mids: list[str] = []
+        for offer_block in offer_blocks:
+            media_type = _sdp_media_type(offer_block)
+            offer_mid = _sdp_mid(offer_block)
+            pool = remaining_by_type.get(media_type, [])
+            if pool:
+                chosen = pool.pop(0)
+                mid_val = offer_mid if offer_mid is not None else _sdp_mid(chosen)
+                if offer_mid is not None:
+                    chosen = _sdp_with_mid(chosen, offer_mid)
+                aligned_blocks.append(chosen)
+            else:
+                mid_val = offer_mid if offer_mid is not None else str(len(aligned_blocks))
+                aligned_blocks.append(_sdp_rejected_block(media_type, mid_val))
+            used_mids.append(mid_val)
+
+        new_session = []
+        for line in answer_session:
+            if line.startswith("a=group:BUNDLE"):
+                new_session.append("a=group:BUNDLE " + " ".join(used_mids))
+            else:
+                new_session.append(line)
+
+        result_lines = new_session + [l for block in aligned_blocks for l in block]
+        return "\r\n".join(result_lines) + "\r\n"
+    except Exception:
+        # If anything about the SDP shape surprises us, fall back to the
+        # original answer rather than breaking the whole connection attempt.
+        _LOGGER.exception("Failed to align Wisenet WAVE answer SDP to offer, using it unmodified")
+        return answer_sdp
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up camera entities from Wisenet WAVE API."""
     client = hass.data[DOMAIN][entry.entry_id]
@@ -96,6 +202,8 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
         self._active_sessions: dict[str, aiohttp.ClientWebSocketResponse] = {}
         # Session_id als Key, True sobald für diese Session eine SDP-Answer kam
         self._answered_sessions: dict[str, bool] = {}
+        # Session_id als Key, ursprünglicher Browser-Offer (für SDP-Angleichung)
+        self._offers: dict[str, str] = {}
 
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
@@ -111,6 +219,7 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
 
         self._active_sessions[session_id] = ws
         self._answered_sessions[session_id] = False
+        self._offers[session_id] = offer_sdp
 
         # 2. Send the SDP Offer via JSON
         # WICHTIG: Wisenet WAVE erwartet SDP-Nachrichten NICHT flach als
@@ -176,7 +285,9 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                         if isinstance(sdp_wrapper, dict) and "sdp" in sdp_wrapper:
                             got_answer = True
                             self._answered_sessions[session_id] = True
-                            send_message(WebRTCAnswer(sdp_wrapper["sdp"]))
+                            offer_sdp = self._offers.get(session_id, "")
+                            aligned_sdp = _align_answer_to_offer(offer_sdp, sdp_wrapper["sdp"])
+                            send_message(WebRTCAnswer(aligned_sdp))
 
                         elif isinstance(ice_wrapper, dict) and "candidate" in ice_wrapper:
                             sdp_mid = ice_wrapper.get("sdpMid")
@@ -193,7 +304,9 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                         elif data.get("type") == "answer" and "sdp" in data:
                             got_answer = True
                             self._answered_sessions[session_id] = True
-                            send_message(WebRTCAnswer(data["sdp"]))
+                            offer_sdp = self._offers.get(session_id, "")
+                            aligned_sdp = _align_answer_to_offer(offer_sdp, data["sdp"])
+                            send_message(WebRTCAnswer(aligned_sdp))
 
                         elif data.get("type") == "candidate" and "candidate" in data:
                             send_message(
@@ -256,6 +369,7 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
         """Clean up when the frontend closes the WebRTC session or connection drops."""
         ws = self._active_sessions.pop(session_id, None)
         self._answered_sessions.pop(session_id, None)
+        self._offers.pop(session_id, None)
         if ws and not ws.closed:
             # We schedule the closing so we don't block the callback
             self.hass.async_create_task(ws.close())
