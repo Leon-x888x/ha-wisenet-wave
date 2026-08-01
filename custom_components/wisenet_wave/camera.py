@@ -47,7 +47,7 @@ def _sdp_parse_sections(sdp: str) -> tuple[list[str], list[list[str]]]:
 
 
 def _sdp_media_type(block: list[str]) -> str:
-    return block[0][2:].split(" ", 1)[0]
+    return block[0][2:].split()[0]
 
 
 def _sdp_mid(block: list[str]) -> str | None:
@@ -100,10 +100,7 @@ def _sdp_rejected_block(media_type: str, mid: str) -> list[str]:
 
 
 def _sdp_is_rejected(block: list[str]) -> bool:
-    """An m= line with port 0 means the offerer explicitly rejected/removed
-    this media section (e.g. during renegotiation after a failed attempt).
-    The answer MUST mirror that with port 0 too."""
-    parts = block[0].split(" ")
+    parts = block[0].split()
     return len(parts) > 1 and parts[1] == "0"
 
 
@@ -150,6 +147,8 @@ def _align_answer_to_offer(offer_sdp: str, answer_sdp: str) -> str:
             else:
                 mid_val = offer_mid if offer_mid is not None else str(len(aligned_blocks))
                 aligned_blocks.append(_sdp_rejected_block(media_type, mid_val))
+                continue
+                
             used_mids.append(mid_val)
 
         new_session = []
