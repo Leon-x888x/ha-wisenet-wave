@@ -1,5 +1,6 @@
 """Camera platform for Wisenet WAVE."""
-from homeassistant.components.camera import Camera
+import urllib.parse
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
@@ -24,6 +25,9 @@ class WisenetWaveCamera(Camera):
         self._cam_id = camera_info.get("id")
         self._attr_name = camera_info.get("name", "Wisenet Camera")
         self._attr_unique_id = f"wisenet_wave_{self._cam_id}"
+        
+        # Wir teilen Home Assistant mit, dass diese Kamera einen echten Stream liefert
+        self._attr_supported_features = CameraEntityFeature.STREAM
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -46,3 +50,13 @@ class WisenetWaveCamera(Camera):
         except Exception:
             return None
         return None
+
+    async def async_stream_source(self) -> str | None:
+        """Return the RTSP stream URL for the camera."""
+        # Passwort URL-sicher machen (wichtig bei Sonderzeichen wie @ oder !)
+        safe_password = urllib.parse.quote(self.client.password)
+        
+        # Wisenet WAVE stellt den echten RTSP Stream auf demselben Port bereit
+        # Wir fordern hier den hochauflösenden Stream an (?resolution=high)
+        stream_url = f"rtsp://{self.client.username}:{safe_password}@{self.client.host}:{self.client.port}/{self._cam_id}?resolution=high"
+        return stream_url
