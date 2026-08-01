@@ -23,19 +23,14 @@ class WisenetWaveApiClient:
         }
         
         try:
-            _LOGGER.info("Attempting login to Wisenet WAVE at %s", url)
             async with self.session.post(url, json=payload, timeout=10, ssl=False) as response:
                 if response.status in (200, 201):
                     data = await response.json()
                     self._token = data.get("token")
                     if self._token:
-                        _LOGGER.info("Successfully authenticated with Wisenet WAVE.")
                         return True
-                    _LOGGER.error("Wisenet WAVE response did not contain a valid token.")
                     return False
-                else:
-                    _LOGGER.error("Wisenet WAVE Login failed with HTTP status: %s", response.status)
-                    return False
+                return False
         except Exception as err:
             _LOGGER.error("Error logging in to Wisenet WAVE: %s", err)
             return False
@@ -49,19 +44,15 @@ class WisenetWaveApiClient:
         return {}
 
     async def async_test_connection(self) -> bool:
-        """Test authentication and connectivity."""
+        """Test authentication and connectivity using devices endpoint."""
         if not await self.async_login():
             return False
             
-        # WIR ÄNDERN HIER DEN ENDPUNKT VON system/info ZU devices
         url = f"{self.base_url}/rest/v4/devices"
         headers = await self._get_headers()
         try:
             async with self.session.get(url, headers=headers, timeout=10, ssl=False) as response:
-                if response.status == 200:
-                    return True
-                _LOGGER.error("Connection test failed with status: %s", response.status)
-                return False
+                return response.status == 200
         except Exception as err:
             _LOGGER.error("Unexpected error connecting to Wisenet WAVE: %s", err)
             return False
@@ -82,3 +73,23 @@ class WisenetWaveApiClient:
         except Exception as err:
             _LOGGER.error("Error fetching cameras: %s", err)
             return []
+
+    async def async_send_webrtc_offer(self, camera_id: str, offer_sdp: str) -> str | None:
+        """Send WebRTC SDP offer to Wisenet WAVE API and return SDP answer."""
+        headers = await self._get_headers()
+        if not headers:
+            return None
+
+        url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc"
+        payload = {"sdp": offer_sdp}
+
+        try:
+            async with self.session.post(url, json=payload, headers=headers, timeout=10, ssl=False) as response:
+                if response.status in (200, 201):
+                    data = await response.json()
+                    return data.get("sdp")
+                _LOGGER.error("Wisenet WebRTC SDP exchange failed with status %s", response.status)
+                return None
+        except Exception as err:
+            _LOGGER.error("Error exchanging WebRTC offer with Wisenet WAVE: %s", err)
+            return None
