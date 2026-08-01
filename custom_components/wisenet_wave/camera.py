@@ -231,6 +231,7 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
             }
         }
         _LOGGER.debug("Sending WebRTC offer to WAVE for camera %s (session %s)", self._cam_id, session_id)
+        _LOGGER.debug("Browser offer SDP for session %s:\n%s", session_id, offer_sdp)
         await ws.send_json(offer_payload)
 
         # 3. Start a background task to listen for the Answer and ICE candidates
@@ -287,6 +288,15 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                             self._answered_sessions[session_id] = True
                             offer_sdp = self._offers.get(session_id, "")
                             aligned_sdp = _align_answer_to_offer(offer_sdp, sdp_wrapper["sdp"])
+                            _LOGGER.debug(
+                                "Aligned WAVE answer for session %s (offer m-lines=%d, "
+                                "raw answer m-lines=%d, aligned m-lines=%d):\n%s",
+                                session_id,
+                                offer_sdp.count("\nm="),
+                                sdp_wrapper["sdp"].count("\nm="),
+                                aligned_sdp.count("m="),
+                                aligned_sdp,
+                            )
                             send_message(WebRTCAnswer(aligned_sdp))
 
                         elif isinstance(ice_wrapper, dict) and "candidate" in ice_wrapper:
