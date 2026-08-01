@@ -76,9 +76,10 @@ class WisenetWaveApiClient:
 
     async def async_send_webrtc_offer(self, camera_id: str, offer_sdp: str) -> str | None:
         """Send WebRTC SDP offer to Wisenet WAVE API and return SDP answer."""
-        # resolution=high fordert explizit den Hauptstream an, statt dass der
-        # Server (mangels Angabe) auf den fps-reduzierten Vorschau-/Sekundärstream ausweicht.
-        url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc?resolution=high"
+        # stream=0 fordert den nativen Hauptstream an, statt dass der Server
+        # entweder auf den Sekundärstream ausweicht oder (bei "resolution=..")
+        # unnötiges Transcoding anstößt, das schwächere Server ins Stocken bringt.
+        url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc?stream=0"
         payload = {"sdp": offer_sdp}
 
         for attempt in range(2):

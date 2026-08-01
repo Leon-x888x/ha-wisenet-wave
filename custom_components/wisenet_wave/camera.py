@@ -54,8 +54,11 @@ class WisenetWaveCamera(Camera):
 
     async def async_stream_source(self) -> str | None:
         """Return the RTSP stream URL for the camera."""
+        # stream=0 fordert den nativen Hauptstream (hohe Qualität) an, OHNE
+        # serverseitiges Transcoding zu erzwingen (das "resolution"-Param tut das
+        # und überlastet schwächere WAVE-Server, was zu Rucklern führt).
         safe_password = urllib.parse.quote(self.client.password)
-        return f"rtsp://{self.client.username}:{safe_password}@{self.client.host}:{self.client.port}/{self._cam_id}?resolution=high"
+        return f"rtsp://{self.client.username}:{safe_password}@{self.client.host}:{self.client.port}/{self._cam_id}?stream=0"
 
     async def async_handle_web_rtc_offer(self, offer_sdp: str) -> str | None:
         """Handle WebRTC SDP offer natively via Wisenet WAVE API."""
