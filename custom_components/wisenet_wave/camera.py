@@ -18,6 +18,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class WisenetWaveCamera(Camera):
     """Representation of a Wisenet WAVE camera."""
 
+    # GANZ WICHTIG: Das hier muss hier oben stehen! (Ohne self.)
+    _attr_supported_features = CameraEntityFeature.STREAM
+
     def __init__(self, client, camera_info, entry: ConfigEntry):
         super().__init__()
         self.client = client
@@ -26,9 +29,6 @@ class WisenetWaveCamera(Camera):
         self._cam_id = camera_info.get("id")
         self._attr_name = camera_info.get("name", "Wisenet Camera")
         self._attr_unique_id = f"wisenet_wave_{self._cam_id}"
-        
-        # Unterstützte Features aktivieren (Stream)
-        self._attr_supported_features = CameraEntityFeature.STREAM
 
     @property
     def device_info(self) -> DeviceInfo:
