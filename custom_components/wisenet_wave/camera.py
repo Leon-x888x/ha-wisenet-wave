@@ -74,7 +74,7 @@ def _sdp_fix_setup_for_answer(block: list[str]) -> list[str]:
     """
     out = []
     for line in block:
-        if line.strip() == "a=setup:actpass":
+        if line.strip().lower() == "a=setup:actpass":
             out.append("a=setup:passive")
         else:
             out.append(line)
@@ -88,6 +88,7 @@ def _sdp_rejected_block(media_type: str, mid: str) -> list[str]:
         f"m={media_type} 0 {proto} {fmt}",
         "c=IN IP4 0.0.0.0",
         f"a=mid:{mid}",
+        "a=setup:passive",
         "a=inactive",
     ]
 
