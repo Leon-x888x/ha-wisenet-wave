@@ -1,5 +1,4 @@
 """Camera platform for Wisenet WAVE."""
-import aiohttp
 from homeassistant.components.camera import Camera
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -12,10 +11,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     client = hass.data[DOMAIN][entry.entry_id]
     raw_cameras = await client.async_get_cameras()
 
-    entities = []
-    for cam in raw_cameras:
-        entities.append(WisenetWaveCamera(client, cam))
-
+    entities = [WisenetWaveCamera(client, cam) for cam in raw_cameras]
     async_add_entities(entities)
 
 class WisenetWaveCamera(Camera):
@@ -40,11 +36,11 @@ class WisenetWaveCamera(Camera):
         )
 
     async def async_camera_image(self, width=None, height=None) -> bytes | None:
-        """Fetch thumbnail snapshot from camera via WAVE API."""
+        """Fetch thumbnail snapshot from camera via WAVE API using Bearer Token."""
         url = f"{self.client.base_url}/ec2/cameraThumbnail?cameraId={self._cam_id}"
-        auth = aiohttp.BasicAuth(self.client.username, self.client.password)
+        headers = await self.client._get_headers()
         try:
-            async with self.client.session.get(url, auth=auth, timeout=5) as response:
+            async with self.client.session.get(url, headers=headers, timeout=5, ssl=False) as response:
                 if response.status == 200:
                     return await response.read()
         except Exception:
