@@ -99,6 +99,14 @@ def _sdp_rejected_block(media_type: str, mid: str) -> list[str]:
     ]
 
 
+def _sdp_is_rejected(block: list[str]) -> bool:
+    """An m= line with port 0 means the offerer explicitly rejected/removed
+    this media section (e.g. during renegotiation after a failed attempt).
+    The answer MUST mirror that with port 0 too."""
+    parts = block[0].split(" ")
+    return len(parts) > 1 and parts[1] == "0"
+
+
 def _align_answer_to_offer(offer_sdp: str, answer_sdp: str) -> str:
     """Reorder/filter the m= sections of `answer_sdp` to exactly match the
     count, order and mid values of `offer_sdp`'s m= sections.
@@ -121,6 +129,16 @@ def _align_answer_to_offer(offer_sdp: str, answer_sdp: str) -> str:
         for offer_block in offer_blocks:
             media_type = _sdp_media_type(offer_block)
             offer_mid = _sdp_mid(offer_block)
+
+            if _sdp_is_rejected(offer_block):
+                # Offer explicitly declined this m-line (port 0) - the answer
+                # MUST mirror that exactly, we must not fill it with a real
+                # WAVE track even if one happens to be available. Rejected
+                # m-lines are also excluded from the BUNDLE group.
+                mid_val = offer_mid if offer_mid is not None else str(len(aligned_blocks))
+                aligned_blocks.append(_sdp_rejected_block(media_type, mid_val))
+                continue
+
             pool = remaining_by_type.get(media_type, [])
             if pool:
                 chosen = pool.pop(0)
