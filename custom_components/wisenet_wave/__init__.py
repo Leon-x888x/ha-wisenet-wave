@@ -1,6 +1,6 @@
 """The Wisenet WAVE integration."""
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DOMAIN, CONF_HOST, CONF_PORT, CONF_USERNAME, CONF_PASSWORD
@@ -23,6 +23,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = client
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # --- NEU: Unser Custom Service für die Archiv-Abfrage ---
+    async def handle_get_archive(call: ServiceCall):
+        """Handler für den wisenet_wave.get_archive Service."""
+        camera_id = call.data.get("camera_id")
+        # Standard ist jetzt (wird von der Karte später genau mitgegeben)
+        import time
+        timestamp_ms = call.data.get("timestamp_ms", int(time.time() * 1000))
+        
+        url = client.get_hls_archive_url(camera_id, timestamp_ms)
+        
+        # Wir geben die URL als Event oder Response an das Frontend zurück
+        hass.bus.async_fire("wisenet_wave_archive_url", {"url": url})
+        return {"url": url}
+
+    hass.services.async_register(
+        DOMAIN, "get_archive", handle_get_archive, supports_response=True
+    )
+    # ---------------------------------------------------------
 
     return True
 

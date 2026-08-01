@@ -73,3 +73,15 @@ class WisenetWaveApiClient:
         except Exception as err:
             _LOGGER.error("Error fetching cameras: %s", err)
             return []
+
+    def get_hls_archive_url(self, camera_id: str, timestamp_ms: int) -> str:
+        """
+        Generiert die HLS-Stream-URL für eine bestimmte Zeit.
+        timestamp_ms: Unix-Timestamp in Millisekunden.
+        """
+        import urllib.parse
+        safe_password = urllib.parse.quote(self.password)
+        
+        # Wisenet WAVE HLS Endpunkt für Archive. 
+        # pos = Startzeitpunkt (Epoch in ms). 
+        return f"https://{self.username}:{safe_password}@{self.host}:{self.port}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
