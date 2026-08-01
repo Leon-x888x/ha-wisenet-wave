@@ -11,7 +11,8 @@ class WisenetWaveApiClient:
         self.username = username
         self.password = password
         self.session = session
-        self.base_url = f"http://{host}:{port}"
+        # HTTPS nutzen, da WAVE verschlüsselte Verbindungen erzwingt
+        self.base_url = f"https://{host}:{port}"
 
     async def async_test_connection(self) -> bool:
         """Test authentication and connectivity."""
@@ -20,13 +21,14 @@ class WisenetWaveApiClient:
         
         try:
             _LOGGER.info("Connecting to Wisenet WAVE at %s", url)
+            # ssl=False ignoriert Zertifikatsfehler bei lokaler IP-Adresse
             async with self.session.get(url, auth=auth, timeout=10, ssl=False) as response:
                 _LOGGER.info("Wisenet WAVE API Response Status: %s", response.status)
                 
                 if response.status == 200:
                     return True
-                elif response.status == 401:
-                    _LOGGER.error("Wisenet WAVE Auth Failed (401): Digest/Basic Auth disabled or wrong password.")
+                elif response.status in (401, 403):
+                    _LOGGER.error("Wisenet WAVE Auth Failed (%s): Digest/Basic Auth disabled or wrong password.", response.status)
                     return False
                 else:
                     _LOGGER.error("Wisenet WAVE returned HTTP %s", response.status)
