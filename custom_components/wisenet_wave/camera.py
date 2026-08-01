@@ -2,6 +2,7 @@
 import urllib.parse
 import logging
 import json
+import asyncio
 import aiohttp
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -13,6 +14,10 @@ from homeassistant.helpers.entity import DeviceInfo
 from .const import DOMAIN, CONF_STREAM_TYPE, STREAM_TYPE_WEBRTC, STREAM_TYPE_RTSP
 
 _LOGGER = logging.getLogger(__name__)
+
+# Wie lange wir maximal auf die SDP-Answer vom WAVE-Server warten, bevor wir
+# dem Frontend einen Fehler statt eines endlosen Standbilds melden.
+WEBRTC_ANSWER_TIMEOUT = 8
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
@@ -89,6 +94,8 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
         super().__init__(client, camera_info, entry)
         # Session_id als Key, WebSocket-Verbindung als Value
         self._active_sessions: dict[str, aiohttp.ClientWebSocketResponse] = {}
+        # Session_id als Key, True sobald für diese Session eine SDP-Answer kam
+        self._answered_sessions: dict[str, bool] = {}
 
     async def async_handle_async_webrtc_offer(
         self, offer_sdp: str, session_id: str, send_message: WebRTCSendMessage
@@ -103,29 +110,60 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
             return
 
         self._active_sessions[session_id] = ws
+        self._answered_sessions[session_id] = False
 
         # 2. Send the SDP Offer via JSON
         offer_payload = {
             "type": "offer",
             "sdp": offer_sdp
         }
+        _LOGGER.debug("Sending WebRTC offer to WAVE for camera %s (session %s)", self._cam_id, session_id)
         await ws.send_json(offer_payload)
 
         # 3. Start a background task to listen for the Answer and ICE candidates
         self.hass.async_create_task(self._listen_to_webrtc_websocket(session_id, ws, send_message))
 
+        # 4. Watchdog: if no "answer" arrives in time, the WAVE server likely
+        # rejected the stream profile silently (e.g. resolution/bitrate/codec
+        # not supported by its WebRTC gateway). Without this, the frontend
+        # just keeps showing the last still image forever with no error.
+        self.hass.async_create_task(self._watch_for_answer_timeout(session_id, send_message))
+
+    async def _watch_for_answer_timeout(
+        self, session_id: str, send_message: WebRTCSendMessage
+    ) -> None:
+        """Abort with a visible error if no SDP answer shows up in time."""
+        await asyncio.sleep(WEBRTC_ANSWER_TIMEOUT)
+        ws = self._active_sessions.get(session_id)
+        if ws is not None and not self._answered_sessions.get(session_id, False):
+            # Session is still open and was never cleaned up by a real answer/close
+            # -> we timed out waiting for the answer.
+            _LOGGER.error(
+                "No WebRTC answer received from Wisenet WAVE for camera %s within %ss "
+                "(session %s). The WAVE server likely accepted the WebSocket but never "
+                "answered the offer - check if the current stream profile/resolution/"
+                "codec for 'primary' is actually supported by its WebRTC gateway.",
+                self._cam_id, WEBRTC_ANSWER_TIMEOUT, session_id,
+            )
+            send_message(WebRTCError("timeout", "No SDP answer received from Wisenet WAVE server in time"))
+            self.close_webrtc_session(session_id)
+
     async def _listen_to_webrtc_websocket(
         self, session_id: str, ws: aiohttp.ClientWebSocketResponse, send_message: WebRTCSendMessage
     ) -> None:
         """Listen to incoming messages (Answer, Candidates) from the WAVE server."""
+        got_answer = False
         try:
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    _LOGGER.debug("WebRTC WS message for camera %s: %s", self._cam_id, msg.data)
                     try:
                         data = json.loads(msg.data)
                         msg_type = data.get("type")
 
                         if msg_type == "answer" and "sdp" in data:
+                            got_answer = True
+                            self._answered_sessions[session_id] = True
                             send_message(WebRTCAnswer(data["sdp"]))
                         
                         elif msg_type == "candidate" and "candidate" in data:
@@ -146,7 +184,14 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                         _LOGGER.debug("Received non-JSON message on WebRTC WS for %s", self._cam_id)
 
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    _LOGGER.debug("WebRTC WS closed/error for camera %s", self._cam_id)
+                    if not got_answer:
+                        _LOGGER.error(
+                            "WebRTC WS for camera %s closed/errored before any SDP answer "
+                            "was received (session %s) - close_code=%s",
+                            self._cam_id, session_id, getattr(ws, "close_code", None),
+                        )
+                    else:
+                        _LOGGER.debug("WebRTC WS closed/error for camera %s", self._cam_id)
                     break
         except Exception as err:
             _LOGGER.error("Exception in WebRTC WS listener for camera %s: %s", self._cam_id, err)
@@ -172,6 +217,7 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
     def close_webrtc_session(self, session_id: str) -> None:
         """Clean up when the frontend closes the WebRTC session or connection drops."""
         ws = self._active_sessions.pop(session_id, None)
+        self._answered_sessions.pop(session_id, None)
         if ws and not ws.closed:
             # We schedule the closing so we don't block the callback
             self.hass.async_create_task(ws.close())
