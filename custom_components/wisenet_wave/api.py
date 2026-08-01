@@ -73,32 +73,3 @@ class WisenetWaveApiClient:
         except Exception as err:
             _LOGGER.error("Error fetching cameras: %s", err)
             return []
-
-    async def async_get_webrtc_websocket(self, camera_id: str, stream: str = "primary"):
-        """
-        Open a WebSocket connection for WebRTC signaling (Offer/Answer/Candidates).
-        Returns the active WebSocket response object or None if connection fails.
-        """
-        # We construct the REST endpoint; aiohttp ws_connect handles the WebSocket Upgrade
-        url = f"{self.base_url}/rest/v4/devices/{camera_id}/webrtc?stream={stream}"
-        
-        for attempt in range(2):
-            headers = await self._get_headers()
-            if not headers:
-                return None
-
-            try:
-                # Use ws_connect with ssl=False to match REST behavior for local IPs / self-signed certs
-                ws = await self.session.ws_connect(url, headers=headers, ssl=False)
-                return ws
-            except aiohttp.WSServerHandshakeError as err:
-                if err.status == 401 and attempt == 0:
-                    _LOGGER.debug("Wisenet WebRTC token expired during WS handshake, re-authenticating")
-                    self._token = None
-                    continue
-                _LOGGER.error("WebSocket Handshake Error for WebRTC on camera %s: %s", camera_id, err)
-                return None
-            except Exception as err:
-                _LOGGER.error("Unexpected error opening WebRTC WebSocket to Wisenet WAVE: %s", err)
-                return None
-        return None
