@@ -24,19 +24,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # --- NEU: Unser Custom Service für die Archiv-Abfrage ---
+   # --- NEU: Unser Custom Service für die Archiv-Abfrage ---
     async def handle_get_archive(call: ServiceCall):
         """Handler für den wisenet_wave.get_archive Service."""
         camera_id = call.data.get("camera_id")
-        # Standard ist jetzt (wird von der Karte später genau mitgegeben)
         import time
         timestamp_ms = call.data.get("timestamp_ms", int(time.time() * 1000))
         
-        url = client.get_hls_archive_url(camera_id, timestamp_ms)
+        # Wir bauen die URL jetzt OHNE admin:passwort
+        url = f"https://{client.host}:{client.port}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
         
-        # Wir geben die URL als Event oder Response an das Frontend zurück
-        hass.bus.async_fire("wisenet_wave_archive_url", {"url": url})
-        return {"url": url}
+        # Wir holen den aktuellen Token
+        token = client._token
+        
+        # Senden URL und Token zurück ans Frontend
+        return {
+            "url": url,
+            "token": token
+        }
 
     hass.services.async_register(
         DOMAIN, "get_archive", handle_get_archive, supports_response=True
