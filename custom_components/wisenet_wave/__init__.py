@@ -1,4 +1,5 @@
 """The Wisenet WAVE integration."""
+import os
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -22,22 +23,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = client
 
+    # --- NEU: Frontend-Karte über die Integration hosten ---
+    card_path = hass.config.path(f"custom_components/{DOMAIN}/wisenet-wave-card.js")
+    if os.path.exists(card_path):
+        hass.http.register_static_path(
+            f"/{DOMAIN}_card/wisenet-wave-card.js",
+            card_path,
+            cache_headers=False
+        )
+    # -------------------------------------------------------
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-   # --- NEU: Unser Custom Service für die Archiv-Abfrage ---
+    # --- Unser Custom Service für die Archiv-Abfrage ---
     async def handle_get_archive(call: ServiceCall):
         """Handler für den wisenet_wave.get_archive Service."""
         camera_id = call.data.get("camera_id")
         import time
         timestamp_ms = call.data.get("timestamp_ms", int(time.time() * 1000))
         
-        # Wir bauen die URL jetzt OHNE admin:passwort
         url = f"https://{client.host}:{client.port}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
-        
-        # Wir holen den aktuellen Token
         token = client._token
         
-        # Senden URL und Token zurück ans Frontend
         return {
             "url": url,
             "token": token
