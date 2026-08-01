@@ -202,11 +202,20 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
         """Handle a WebRTC candidate from the HA frontend and send it to WAVE."""
         ws = self._active_sessions.get(session_id)
         if ws and not ws.closed:
+            # HA's RTCIceCandidateInit uses snake_case (sdp_m_line_index, sdp_mid)
+            # in newer Core versions, older ones used camelCase - support both.
+            sdp_m_line_index = getattr(candidate, "sdp_m_line_index", None)
+            if sdp_m_line_index is None:
+                sdp_m_line_index = getattr(candidate, "sdpMLineIndex", None)
+            sdp_mid = getattr(candidate, "sdp_mid", None)
+            if sdp_mid is None:
+                sdp_mid = getattr(candidate, "sdpMid", None)
+
             payload = {
                 "type": "candidate",
                 "candidate": candidate.candidate,
-                "sdpMLineIndex": candidate.sdpMLineIndex,
-                "sdpMid": candidate.sdpMid
+                "sdpMLineIndex": sdp_m_line_index,
+                "sdpMid": sdp_mid
             }
             try:
                 await ws.send_json(payload)
