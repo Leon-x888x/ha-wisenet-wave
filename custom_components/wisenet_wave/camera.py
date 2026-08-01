@@ -6,7 +6,13 @@ import asyncio
 import aiohttp
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.components.camera.webrtc import WebRTCAnswer, WebRTCError, WebRTCSendMessage, WebRTCCandidate
+from homeassistant.components.camera.webrtc import (
+    RTCIceCandidateInit,
+    WebRTCAnswer,
+    WebRTCCandidate,
+    WebRTCError,
+    WebRTCSendMessage,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
@@ -321,9 +327,11 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                             sdp_mid = ice_wrapper.get("sdpMid")
                             send_message(
                                 WebRTCCandidate(
-                                    ice_wrapper["candidate"],
-                                    ice_wrapper.get("sdpMLineIndex"),
-                                    str(sdp_mid) if sdp_mid is not None else None,
+                                    RTCIceCandidateInit(
+                                        ice_wrapper["candidate"],
+                                        sdp_mid=str(sdp_mid) if sdp_mid is not None else None,
+                                        sdp_m_line_index=ice_wrapper.get("sdpMLineIndex") or 0,
+                                    )
                                 )
                             )
 
@@ -337,11 +345,14 @@ class WisenetWaveWebRTCCamera(WisenetWaveCameraBase):
                             send_message(WebRTCAnswer(aligned_sdp))
 
                         elif data.get("type") == "candidate" and "candidate" in data:
+                            fallback_mid = data.get("sdpMid")
                             send_message(
                                 WebRTCCandidate(
-                                    data["candidate"],
-                                    data.get("sdpMLineIndex"),
-                                    data.get("sdpMid")
+                                    RTCIceCandidateInit(
+                                        data["candidate"],
+                                        sdp_mid=str(fallback_mid) if fallback_mid is not None else None,
+                                        sdp_m_line_index=data.get("sdpMLineIndex"),
+                                    )
                                 )
                             )
 
