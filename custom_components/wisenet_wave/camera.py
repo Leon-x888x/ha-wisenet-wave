@@ -36,6 +36,11 @@ class WisenetWaveCamera(Camera):
         self._attr_unique_id = f"wisenet_wave_{self._cam_id}"
 
     @property
+    def extra_state_attributes(self):
+        """Expose the internal Wisenet WAVE camera id for use by the Lovelace card."""
+        return {"wisenet_camera_id": self._cam_id}
+
+    @property
     def device_info(self) -> DeviceInfo:
         """Connects entity to Home Assistant Device Registry."""
         return DeviceInfo(

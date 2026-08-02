@@ -1,10 +1,29 @@
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
   setConfig(config) {
-    if (!config.camera_id) {
-      throw new Error('Du musst eine camera_id in der Konfiguration angeben!');
+    if (!config.entity && !config.camera_id) {
+      throw new Error('Du musst entweder "entity" (z.B. camera.terrasse) oder "camera_id" angeben!');
     }
     this.config = config;
+  }
+
+  // Ermittelt die interne Wisenet-Kamera-ID: entweder direkt aus camera_id,
+  // oder aus dem "wisenet_camera_id"-Attribut der angegebenen Entity.
+  resolveCameraId() {
+    if (this.config.camera_id) {
+      return this.config.camera_id;
+    }
+    const stateObj = this._hass?.states[this.config.entity];
+    if (!stateObj) {
+      this.errorEl && (this.errorEl.innerText = `Entity ${this.config.entity} nicht gefunden.`);
+      return null;
+    }
+    const camId = stateObj.attributes.wisenet_camera_id;
+    if (!camId) {
+      this.errorEl && (this.errorEl.innerText = `Entity ${this.config.entity} hat kein wisenet_camera_id-Attribut. Bitte Integration aktualisieren.`);
+      return null;
+    }
+    return camId;
   }
 
   // Home Assistant Objekt (wird bei jeder Änderung von HA aktualisiert)
@@ -43,6 +62,11 @@ class WisenetWaveCard extends HTMLElement {
       return;
     }
 
+    const camId = this.resolveCameraId();
+    if (!camId) {
+      return; // Fehlermeldung wurde bereits in resolveCameraId() gesetzt
+    }
+
     // Zeitstempel in Millisekunden umwandeln
     const timestampMs = new Date(timeValue).getTime();
 
@@ -53,7 +77,7 @@ class WisenetWaveCard extends HTMLElement {
         domain: 'wisenet_wave',
         service: 'get_archive',
         service_data: {
-          camera_id: this.config.camera_id,
+          camera_id: camId,
           timestamp_ms: timestampMs
         },
         return_response: true
