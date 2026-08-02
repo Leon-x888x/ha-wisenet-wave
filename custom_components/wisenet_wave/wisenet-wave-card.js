@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-h geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-i geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -274,6 +274,22 @@ class WisenetWaveCard extends HTMLElement {
     // feuert zuverlässig, sobald die echten Dimensionen des neuen Streams
     // bekannt sind - genau der richtige Zeitpunkt für den Reflow-Trick.
     this.videoEl.addEventListener('loadedmetadata', () => {
+      // Diagnose-Log: zeigt die TATSÄCHLICHE Auflösung/Seitenverhältnis des
+      // gerade geladenen Videos, plus (falls vorhanden) die von hls.js
+      // gewählte Qualitätsstufe. Damit lässt sich unterscheiden, ob das
+      // Balken-Problem an einem Renderingfehler liegt (Auflösung stimmt,
+      // Darstellung nicht) oder daran, dass der Server tatsächlich ein
+      // Video mit anderem Seitenverhältnis ausliefert (z.B. weil im
+      // Archiv-Modus eine andere Qualitätsstufe/"lo"-Variante als im
+      // Live-Modus gewählt wird).
+      const vw = this.videoEl.videoWidth;
+      const vh = this.videoEl.videoHeight;
+      const level = this.hls && this.hls.currentLevel >= 0 ? this.hls.levels?.[this.hls.currentLevel] : null;
+      console.info(
+        `[wisenet-wave-card] loadedmetadata: video=${vw}x${vh} (Seitenverhältnis ${(vw / vh).toFixed(3)}), ` +
+        `Modus=${this._streamMode}, hls-Level=${this.hls?.currentLevel ?? 'n/a'}` +
+        (level ? ` (${level.width}x${level.height}, bitrate=${level.bitrate})` : ''),
+      );
       this._refreshVideoLayout();
     });
   }
