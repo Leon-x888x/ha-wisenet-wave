@@ -105,7 +105,7 @@ class WisenetWaveApiClient:
         # beieinander liegen. Bei großen Zeitfenstern (mehrere Tage/Wochen)
         # grob genug wählen, damit die Antwort nicht ausufert.
         span_ms = max(end_ms - start_ms, 1)
-        detail = max(60_000, min(span_ms // 1000, 3_600_000))
+        detail = max(600_000, min(span_ms // 1000, 3_600_000))
 
         url = f"{self.base_url}/rest/v4/devices/{camera_id}/footage"
         params = {
