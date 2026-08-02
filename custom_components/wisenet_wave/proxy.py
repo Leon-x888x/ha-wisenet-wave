@@ -9,6 +9,7 @@ import logging
 import urllib.parse
 from datetime import timedelta
 
+import aiohttp
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.components.http.auth import async_sign_path
@@ -48,15 +49,45 @@ class WisenetWaveProxyView(HomeAssistantView):
         if upstream_params:
             target_url += f"?{urllib.parse.urlencode(upstream_params)}"
 
-        for attempt in range(2):
-            headers = await client._get_headers(force_refresh=attempt > 0)
+        # Bug-Fix-Versuch: Der /hls/-Streaming-Endpunkt von Wisenet WAVE
+        # akzeptiert auf manchen Server-Versionen KEINEN Bearer-Token aus der
+        # REST-v4-Login-API, sondern verlangt klassische HTTP-Basic-Auth
+        # (Username/Passwort). Bisher haben wir hier ausschließlich Bearer
+        # geschickt, was ohne jede Exception in unserem Code mit HTTP
+        # 502/404 vom WAVE-Server selbst quittiert wurde (kein Log-Eintrag,
+        # weil das eine "normale" HTTP-Antwort ist, keine Exception).
+        # Strategie: erst Bearer versuchen (mit einem Retry bei 401/403 nach
+        # Token-Refresh, wie bisher), und falls das WEITERHIN mit
+        # 401/403/404/502 fehlschlägt, einmal zusätzlich mit Basic-Auth
+        # probieren, bevor wir endgültig aufgeben.
+        auth_attempts = [
+            {"force_refresh": False, "basic": False},
+            {"force_refresh": True, "basic": False},
+            {"force_refresh": False, "basic": True},
+        ]
+
+        last_resp_status = None
+        last_resp_body = None
+        last_resp_content_type = None
+
+        for attempt_info in auth_attempts:
+            request_kwargs = {"ssl": False, "timeout": 15}
+            if attempt_info["basic"]:
+                request_kwargs["auth"] = aiohttp.BasicAuth(client.username, client.password)
+                headers = {}
+            else:
+                headers = await client._get_headers(force_refresh=attempt_info["force_refresh"])
             try:
                 async with client.session.get(
-                    target_url, headers=headers, ssl=False, timeout=15
+                    target_url, headers=headers, **request_kwargs
                 ) as resp:
-                    if resp.status in (401, 403) and attempt == 0:
-                        client._token = None
-                        client._token_expires_at = 0
+                    if resp.status in (401, 403, 404, 502):
+                        if resp.status in (401, 403):
+                            client._token = None
+                            client._token_expires_at = 0
+                        last_resp_status = resp.status
+                        last_resp_body = await resp.read()
+                        last_resp_content_type = resp.headers.get("Content-Type", "text/plain")
                         continue
 
                     body = await resp.read()
@@ -65,12 +96,25 @@ class WisenetWaveProxyView(HomeAssistantView):
                     if path.endswith(".m3u8"):
                         body = self._rewrite_playlist(body, entry_id)
 
+                    if attempt_info["basic"]:
+                        _LOGGER.info(
+                            "wisenet_wave: /hls/-Endpunkt hat mit Basic-Auth funktioniert, "
+                            "nicht mit Bearer-Token (%s)", target_url,
+                        )
+
                     return web.Response(body=body, status=resp.status, content_type=content_type)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.error("Wisenet WAVE proxy error for %s: %s", target_url, err)
                 return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
 
-        return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
+        # Alle Auth-Varianten fehlgeschlagen - die letzte Antwort vom
+        # WAVE-Server durchreichen (statt eines generischen 502), damit man
+        # in der Karte/den Dev-Tools sieht, was der Server WIRKLICH zurückgibt.
+        return web.Response(
+            body=last_resp_body or b"",
+            status=last_resp_status or 502,
+            content_type=last_resp_content_type or "text/plain",
+        )
 
     def _rewrite_playlist(self, body: bytes, entry_id: str) -> bytes:
         """Rewrite segment/sub-playlist URIs in an m3u8 to point back through the proxy.

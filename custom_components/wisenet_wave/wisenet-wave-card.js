@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-f geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-g geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
