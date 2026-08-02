@@ -84,30 +84,41 @@ class WisenetWaveApiClient:
         Holt Aufnahme- bzw. Bewegungs-Zeiträume für eine Kamera in einem Zeitfenster.
 
         periods_type: "recording" (durchgehende Aufnahme) oder "motion"
-        (Bewegungserkennung). Nutzt den WAVE/Nx-Legacy-Endpunkt
-        ec2/recordedTimePeriods.
+        (Bewegungserkennung). Nutzt die moderne REST-v4-API
+        GET /rest/v4/devices/{id}/footage (Nachfolger der alten
+        ec2/recordedTimePeriods-Legacy-API).
+
+        Wichtig: periodType=motion braucht laut API-Doku zusätzlich einen
+        "motion"-Parameter mit einem Koordinaten-Rechteck
+        ({x},{y},{width}x{height}, normiert 0..1), das den zu
+        durchsuchenden Bildbereich angibt. Ohne diesen Parameter liefert
+        der Server sonst schlicht die kompletten Aufnahme-Zeiträume zurück
+        (nicht nach Bewegung gefiltert) - das war der eigentliche Bug.
+        Hier wird der komplette Bildbereich (0,0,1x1) übergeben.
 
         Gibt immer ein Tupel (periods, error) zurück statt bei Fehlern
         einfach still eine leere Liste zu liefern - so kann die Karte dem
         Nutzer zeigen, WARUM keine Einfärbung da ist, statt nur grau zu
         bleiben. Bei Erfolg ist error None.
         """
-        # "detail" fasst Chunks zusammen, die näher als X ms beieinander
-        # liegen. Bei großen Zeitfenstern (mehrere Tage/Wochen) grob genug
-        # wählen, damit die Antwort nicht ausufert.
+        # "detailLevelMs" fasst Chunks zusammen, die näher als X ms
+        # beieinander liegen. Bei großen Zeitfenstern (mehrere Tage/Wochen)
+        # grob genug wählen, damit die Antwort nicht ausufert.
         span_ms = max(end_ms - start_ms, 1)
         detail = max(60_000, min(span_ms // 1000, 3_600_000))
 
-        url = f"{self.base_url}/ec2/recordedTimePeriods"
+        url = f"{self.base_url}/rest/v4/devices/{camera_id}/footage"
         params = {
-            "cameraId": camera_id,
-            "startTime": str(start_ms),
-            "endTime": str(end_ms),
-            "format": "json",
-            "flat": "true",
-            "detail": str(detail),
-            "periodsType": periods_type,
+            "startTimeMs": str(start_ms),
+            "endTimeMs": str(end_ms),
+            "detailLevelMs": str(detail),
+            "periodType": periods_type,
+            "keepSmallChunks": "true",  # kurze Bewegungs-Events nicht verschlucken
         }
+        if periods_type == "motion":
+            # Gesamten Bildbereich als Bewegungsfenster durchsuchen.
+            params["motion"] = "0,0,1x1"
+
         for attempt in range(2):
             headers = await self._get_headers(force_refresh=attempt > 0)
             if not headers:
@@ -121,49 +132,30 @@ class WisenetWaveApiClient:
                         self._token = None
                         self._token_expires_at = 0
                         _LOGGER.warning(
-                            "wisenet_wave: Token für recordedTimePeriods (%s) für %s ungültig, versuche erneut",
+                            "wisenet_wave: Token für footage (%s) für %s ungültig, versuche erneut",
                             periods_type, camera_id,
                         )
                         continue
                     if response.status != 200:
                         body_snippet = (await response.text())[:300]
                         _LOGGER.warning(
-                            "wisenet_wave: recordedTimePeriods (%s) für Kamera %s antwortete mit "
+                            "wisenet_wave: /rest/v4/devices/%s/footage (%s) antwortete mit "
                             "HTTP %s. URL: %s | Antwort: %s",
-                            periods_type, camera_id, response.status, url, body_snippet,
+                            camera_id, periods_type, response.status, url, body_snippet,
                         )
                         return [], f"HTTP {response.status} von {url}"
                     data = await response.json()
-                    # WAVE liefert trotz "flat=true" i.d.R. KEIN reines Array,
-                    # sondern {"error": "0", "errorId": "ok", "reply": [...]}.
-                    # Die eigentlichen Perioden stecken in "reply".
-                    periods = None
                     if isinstance(data, list):
-                        periods = data
-                    elif isinstance(data, dict):
-                        reply = data.get("reply")
-                        if isinstance(reply, list):
-                            periods = reply
-                        elif str(data.get("error", "0")) not in ("0", ""):
-                            _LOGGER.warning(
-                                "wisenet_wave: recordedTimePeriods (%s) für %s meldete "
-                                "Server-Fehler: %s",
-                                periods_type, camera_id, data.get("errorString") or data.get("errorId"),
-                            )
-                            return [], f"WAVE-Fehler: {data.get('errorString') or data.get('errorId')}"
-
-                    if periods is not None:
-                        return periods, None
-
+                        return data, None
                     _LOGGER.warning(
-                        "wisenet_wave: recordedTimePeriods (%s) für %s lieferte unerwartetes "
-                        "Format (kein JSON-Array): %s",
-                        periods_type, camera_id, str(data)[:300],
+                        "wisenet_wave: /rest/v4/devices/%s/footage (%s) lieferte "
+                        "unerwartetes Format (kein JSON-Array): %s",
+                        camera_id, periods_type, str(data)[:300],
                     )
                     return [], "Unerwartetes Antwortformat vom WAVE-Server"
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning(
-                    "wisenet_wave: Fehler beim Abrufen von recordedTimePeriods (%s) für %s: %s",
+                    "wisenet_wave: Fehler beim Abrufen von footage (%s) für %s: %s",
                     periods_type, camera_id, err,
                 )
                 return [], str(err)
