@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-e geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-f geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -176,6 +176,32 @@ class WisenetWaveCard extends HTMLElement {
           this._refreshVideoLayout();
         }
       });
+
+      // Bug-Fix: Beim ersten Rendern der Karte hat das HA-Dashboard-Grid
+      // (Masonry-Layout) die tatsächliche Breite der Karte oft noch nicht
+      // final berechnet - `_resizeCanvas()` oben liest dann eine falsche
+      // (z.B. 0px) Breite aus getBoundingClientRect(). Ein normales
+      // Layout-Update danach (Sidebar auf/zu, Grid-Neuberechnung, Tab-
+      // Wechsel) löst aber KEIN "window resize"-Event aus, wodurch die
+      // Zeitleiste dauerhaft falsch/leer bleibt - bis irgendein Event
+      // zufällig doch ein window-resize auslöst (z.B. Fullscreen rein+raus,
+      // was der Browser immer mit einem resize-Event begleitet).
+      // Der ResizeObserver beobachtet die tatsächliche Elementgröße direkt
+      // und behebt das zuverlässig, auch beim allerersten Layout-Durchlauf.
+      if (window.ResizeObserver) {
+        this._canvasResizeObserver = new ResizeObserver(() => {
+          this._resizeCanvas();
+          this._drawTimeline();
+        });
+        this._canvasResizeObserver.observe(this.querySelector('.wwc-timeline-wrap'));
+      } else {
+        // Fallback für sehr alte Browser ohne ResizeObserver: nach dem
+        // ersten Layout-Durchlauf (nächster Frame) nochmal neu messen.
+        requestAnimationFrame(() => {
+          this._resizeCanvas();
+          this._drawTimeline();
+        });
+      }
 
       // Standardmäßig direkt live starten, statt mit leerem Player zu warten
       this.seekTo(Date.now(), { isLive: true });
@@ -783,6 +809,16 @@ class WisenetWaveCard extends HTMLElement {
   // Diese Zeile sagt HA, wie groß die Karte im Raster ist
   getCardSize() {
     return 4;
+  }
+
+  // Aufräumen, wenn die Karte aus dem DOM entfernt wird (z.B. Dashboard-
+  // Tab-Wechsel oder Karte gelöscht) - sonst bleibt der ResizeObserver
+  // aktiv und beobachtet ein bereits entferntes Element.
+  disconnectedCallback() {
+    if (this._canvasResizeObserver) {
+      this._canvasResizeObserver.disconnect();
+      this._canvasResizeObserver = null;
+    }
   }
 }
 
