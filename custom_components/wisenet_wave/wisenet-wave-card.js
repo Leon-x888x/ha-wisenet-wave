@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-g geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-h geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -265,6 +265,17 @@ class WisenetWaveCard extends HTMLElement {
         this.errorEl.innerText = '';
       }
     });
+    // Bug-Fix: Nach jedem Stream-Wechsel (Seek, Skip vor/zurück, Reload,
+    // Live<->Archiv) lädt der Browser neue Video-Dimensionen ins gleiche
+    // <video>-Element. "object-fit: contain" wird dabei nicht immer sofort
+    // korrekt neu berechnet, wodurch das Bild kurz (oder dauerhaft, bis ein
+    // Resize/Fullscreen-Event zufällig nachhilft) mit falschem
+    // Seitenverhältnis/schwarzen Balken angezeigt wird. "loadedmetadata"
+    // feuert zuverlässig, sobald die echten Dimensionen des neuen Streams
+    // bekannt sind - genau der richtige Zeitpunkt für den Reflow-Trick.
+    this.videoEl.addEventListener('loadedmetadata', () => {
+      this._refreshVideoLayout();
+    });
   }
 
   // Verhindert einen dauerhaften Ladescreen, wenn für den angefragten
@@ -482,12 +493,19 @@ class WisenetWaveCard extends HTMLElement {
 
   _refreshVideoLayout() {
     if (!this.videoEl || !this._currentStreamUrl) return;
-    const isLive = this._streamMode === 'live' || this._isLive;
-    if (!isLive) return;
+    // Bug-Fix: Dieser Reflow-Trick wurde bisher nur im Live-Modus
+    // ausgeführt ("if (!isLive) return;"). Genau dasselbe Rendering-Problem
+    // (Video wird mit falschem Seitenverhältnis/schwarzen Balken
+    // dargestellt, bis irgendein Layout-Ereignis einen Neuaufbau erzwingt)
+    // tritt aber genauso im Archiv-Modus auf - z.B. nach Skip vor/zurück
+    // oder Neuladen der Karte, wenn ein neuer Stream mit anderen
+    // Dimensionen ins selbe <video>-Element geladen wird und der Browser
+    // "object-fit: contain" nicht sofort neu berechnet. Die frühere
+    // isLive-Einschränkung war also selbst der Bug - jetzt für beide Modi.
     this.videoEl.style.visibility = 'hidden';
     this.videoEl.offsetHeight;
     this.videoEl.style.visibility = 'visible';
-    if (this.videoEl.readyState >= 2) {
+    if (this.videoEl.readyState >= 2 && this.videoEl.paused) {
       this.videoEl.play().catch(() => {});
     }
   }
