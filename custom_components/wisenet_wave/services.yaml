@@ -1,0 +1,24 @@
+get_archive:
+  name: Get archive stream
+  description: >-
+    Ruft die HLS-Archiv-Stream-URL und den Zugriffstoken für eine Wisenet WAVE
+    Kamera zu einem bestimmten Zeitpunkt ab.
+  fields:
+    camera_id:
+      name: Camera ID
+      description: Die interne Wisenet WAVE Kamera-ID.
+      required: true
+      example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      selector:
+        text:
+    timestamp_ms:
+      name: Zeitstempel (ms)
+      description: >-
+        Unix-Zeitstempel in Millisekunden, ab dem die Wiedergabe starten soll.
+        Wenn leer, wird der aktuelle Zeitpunkt verwendet.
+      required: false
+      example: 1719840000000
+      selector:
+        number:
+          min: 0
+          mode: box
