@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-i geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-j geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -822,10 +822,36 @@ class WisenetWaveCard extends HTMLElement {
 
       this.hls.loadSource(url);
       this.hls.attachMedia(this.videoEl);
-      this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      this.hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
         if (token !== this._activeStreamToken) return;
         this.errorEl.innerText = '';
         this._clearLoadWatchdog();
+
+        // Bug-Fix: Nicht der automatischen ABR-Qualitätswahl überlassen,
+        // welche Stufe initial genommen wird - das kann direkt nach dem
+        // Verbinden (bevor genug Bandbreitendaten vorliegen) oder nach
+        // vorherigen Fehlern (hls.js' "Penalty Box"-Mechanismus) auf einer
+        // deutlich kleineren/anderen Substream-Variante landen, z.B.
+        // 640x480 (4:3) statt der echten 16:9-Kameraauflösung - das
+        // erzeugt genau die schwarzen Balken links/rechts. Wir wählen
+        // stattdessen deterministisch die Stufe mit den meisten Pixeln.
+        if (data?.levels?.length) {
+          let bestIdx = 0;
+          let bestPixels = -1;
+          data.levels.forEach((lvl, idx) => {
+            const pixels = (lvl.width || 0) * (lvl.height || 0);
+            if (pixels > bestPixels) {
+              bestPixels = pixels;
+              bestIdx = idx;
+            }
+          });
+          this.hls.currentLevel = bestIdx;
+          console.info(
+            `[wisenet-wave-card] ${data.levels.length} Qualitätsstufe(n) gefunden, wähle Stufe ${bestIdx} ` +
+            `(${data.levels[bestIdx].width}x${data.levels[bestIdx].height}) statt automatischer ABR-Wahl.`,
+          );
+        }
+
         this.videoEl.play().catch(() => {});
       });
 
