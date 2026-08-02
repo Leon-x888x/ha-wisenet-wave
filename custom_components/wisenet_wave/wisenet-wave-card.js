@@ -53,8 +53,8 @@ class WisenetWaveCard extends HTMLElement {
         <ha-card header="${this.config.title || 'Wisenet WAVE Archiv'}">
           <style>
             .wwc-content { padding: 0 16px 16px; }
-            .wwc-video-wrap { position: relative; width: 100%; background: #000; border-radius: 4px; overflow: hidden; }
-            .wwc-video-wrap video { width: 100%; display: block; }
+            .wwc-video-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 4px; overflow: hidden; }
+            .wwc-video-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
             .wwc-live-badge {
               position: absolute; top: 8px; left: 8px; display: none; align-items: center; gap: 5px;
               background: rgba(0,0,0,0.55); color: #fff; font-size: 11px; font-weight: 600;
@@ -161,6 +161,9 @@ class WisenetWaveCard extends HTMLElement {
       this._drawTimeline();
 
       window.addEventListener('resize', () => { this._resizeCanvas(); this._drawTimeline(); });
+
+      // Standardmäßig direkt live starten, statt mit leerem Player zu warten
+      this.seekTo(Date.now(), { isLive: true });
     }
   }
 
@@ -524,7 +527,7 @@ class WisenetWaveCard extends HTMLElement {
         if (endMs < this._viewStart || startMs > this._viewEnd) continue;
         const x1 = ((Math.max(startMs, this._viewStart) - this._viewStart) / viewSpan) * w;
         const x2 = ((Math.min(endMs, this._viewEnd) - this._viewStart) / viewSpan) * w;
-        ctx.fillRect(x1, 0, Math.max(x2 - x1, 1 * dpr), h);
+        ctx.fillRect(x1, 0, Math.max(x2 - x1, 2 * dpr), h);
       }
     };
 
