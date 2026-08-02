@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-d geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-e geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -221,7 +221,15 @@ class WisenetWaveCard extends HTMLElement {
       this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:play');
       this._stopPlayheadLoop();
     });
-    this.videoEl.addEventListener('playing', () => this._clearLoadWatchdog());
+    this.videoEl.addEventListener('playing', () => {
+      this._clearLoadWatchdog();
+      // Wenn die Wiedergabe wirklich wieder läuft, war der vorherige
+      // "fatale" HLS-Fehler offenbar doch selbst-heilend (hls.js/Browser
+      // haben sich erholt) - alte Fehlermeldung dann nicht stehen lassen.
+      if (this.errorEl.innerText.startsWith('HLS Fehler') || this.errorEl.innerText.startsWith('Stream vorübergehend')) {
+        this.errorEl.innerText = '';
+      }
+    });
   }
 
   // Verhindert einen dauerhaften Ladescreen, wenn für den angefragten
@@ -501,6 +509,17 @@ class WisenetWaveCard extends HTMLElement {
 
   // ---------- Zeichnen ----------
 
+  _periodsLookIdentical(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length === 0 || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      const pa = a[i], pb = b[i];
+      if (String(pa.startTimeMs ?? pa.start) !== String(pb.startTimeMs ?? pb.start)) return false;
+      if (String(pa.durationMs ?? pa.duration) !== String(pb.durationMs ?? pb.duration)) return false;
+    }
+    return true;
+  }
+
   _drawTimeline() {
     const ctx = this.canvasEl.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
@@ -546,7 +565,21 @@ class WisenetWaveCard extends HTMLElement {
       const data = this._periodsCache.get(key);
       if (data) {
         drawPeriods(data.recording, recColor);
-        drawPeriods(data.motion, motColor);
+        // Manche WAVE-Server liefern bei periodsType=motion exakt dieselben
+        // Perioden wie bei recording zurück (keine echte Bewegungs-
+        // Filterung verfügbar). Dann würde der rote Bewegungs-Balken den
+        // grünen Aufnahme-Balken komplett verdecken und fälschlich
+        // "durchgehend Bewegung" suggerieren - also in dem Fall lieber gar
+        // nicht zeichnen, statt irreführend alles rot einzufärben.
+        if (!this._periodsLookIdentical(data.recording, data.motion)) {
+          drawPeriods(data.motion, motColor);
+        } else if (!this._motionUnavailableWarned) {
+          this._motionUnavailableWarned = true;
+          console.warn(
+            '[wisenet-wave-card] "motion"-Perioden sind identisch mit "recording" - dein WAVE-Server ' +
+            'scheint periodsType=motion nicht separat zu unterstützen. Bewegungs-Einfärbung wird deshalb ausgeblendet.'
+          );
+        }
       }
     }
 
