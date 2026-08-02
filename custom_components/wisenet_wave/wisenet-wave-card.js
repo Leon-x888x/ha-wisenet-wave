@@ -166,7 +166,16 @@ class WisenetWaveCard extends HTMLElement {
       this._updateTimeLabel();
       this._drawTimeline();
 
-      window.addEventListener('resize', () => { this._resizeCanvas(); this._drawTimeline(); });
+      window.addEventListener('resize', () => {
+        this._resizeCanvas();
+        this._drawTimeline();
+        this._refreshVideoLayout();
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          this._refreshVideoLayout();
+        }
+      });
 
       // Standardmäßig direkt live starten, statt mit leerem Player zu warten
       this.seekTo(Date.now(), { isLive: true });
@@ -443,6 +452,18 @@ class WisenetWaveCard extends HTMLElement {
     const dpr = window.devicePixelRatio || 1;
     this.canvasEl.width = Math.max(1, Math.floor(rect.width * dpr));
     this.canvasEl.height = Math.max(1, Math.floor(46 * dpr));
+  }
+
+  _refreshVideoLayout() {
+    if (!this.videoEl || !this._currentStreamUrl) return;
+    const isLive = this._streamMode === 'live' || this._isLive;
+    if (!isLive) return;
+    this.videoEl.style.visibility = 'hidden';
+    this.videoEl.offsetHeight;
+    this.videoEl.style.visibility = 'visible';
+    if (this.videoEl.readyState >= 2) {
+      this.videoEl.play().catch(() => {});
+    }
   }
 
   // ---------- Daten laden ----------
@@ -736,6 +757,7 @@ class WisenetWaveCard extends HTMLElement {
         maxBufferLength: 20,
         maxBufferHole: 1.5,
         liveDurationInfinity: options.mode === 'live',
+        startPosition: -1,
       });
 
       this.hls.loadSource(url);
