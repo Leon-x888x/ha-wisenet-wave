@@ -1,6 +1,8 @@
 """The Wisenet WAVE integration."""
 import os
+from datetime import timedelta
 from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -50,10 +52,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # URL zeigt jetzt auf unseren eigenen HA-Proxy, nicht direkt auf den WAVE-Server.
         # Das Gerät des Nutzers spricht damit nur noch mit Home Assistant.
+        # Signierte URL statt Auth-Header: das ist der HA-Standardweg für sowas
+        # (genau wie bei den eingebauten Kamera-/Snapshot-URLs).
         proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
+        signed_url = async_sign_path(hass, proxy_url, timedelta(hours=2))
 
         return {
-            "url": proxy_url
+            "url": signed_url
         }
 
     hass.services.async_register(

@@ -111,17 +111,7 @@ class WisenetWaveCard extends HTMLElement {
         this.hls.destroy(); // Alten Stream beenden
       }
 
-      this.hls = new Hls({
-        // Der Proxy-Endpunkt auf HA-Seite verlangt eine gültige HA-Authentifizierung.
-        // Wir schicken hier den HA-eigenen Zugriffstoken mit (NICHT den WAVE-Token,
-        // der bleibt weiterhin nur auf dem HA-Server).
-        xhrSetup: (xhr) => {
-          const accessToken = this._hass?.auth?.data?.access_token;
-          if (accessToken) {
-            xhr.setRequestHeader('Authorization', 'Bearer ' + accessToken);
-          }
-        }
-      });
+      this.hls = new Hls();
 
       this.hls.loadSource(url);
       this.hls.attachMedia(this.videoEl);

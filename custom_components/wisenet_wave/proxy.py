@@ -7,9 +7,11 @@ bytes back. The Bearer token never leaves the HA server.
 """
 import logging
 import urllib.parse
+from datetime import timedelta
 
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
@@ -45,16 +47,19 @@ class WisenetWaveProxyView(HomeAssistantView):
                 content_type = resp.headers.get("Content-Type", "application/octet-stream")
 
                 if path.endswith(".m3u8"):
-                    body = self._rewrite_playlist(body, client.base_url, entry_id)
+                    body = self._rewrite_playlist(body, entry_id)
 
                 return web.Response(body=body, status=resp.status, content_type=content_type)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Wisenet WAVE proxy error for %s: %s", target_url, err)
             return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
 
-    @staticmethod
-    def _rewrite_playlist(body: bytes, base_url: str, entry_id: str) -> bytes:
-        """Rewrite segment/sub-playlist URIs in an m3u8 to point back through the proxy."""
+    def _rewrite_playlist(self, body: bytes, entry_id: str) -> bytes:
+        """Rewrite segment/sub-playlist URIs in an m3u8 to point back through the proxy.
+
+        Every rewritten line is itself signed, so the browser never needs to
+        send an Authorization header - the signature in the URL is enough.
+        """
         proxy_prefix = f"/api/wisenet_wave/proxy/{entry_id}/"
         text = body.decode("utf-8", errors="ignore")
         out_lines = []
@@ -74,6 +79,11 @@ class WisenetWaveProxyView(HomeAssistantView):
                 new_line = proxy_prefix + rel_path
                 if query:
                     new_line += f"?{query}"
+
+                # Segment-/Sub-Playlist-Link signieren, damit der Browser ihn
+                # ohne Auth-Header direkt laden kann.
+                new_line = async_sign_path(self.hass, new_line, timedelta(hours=2))
+
                 out_lines.append(new_line)
             else:
                 out_lines.append(line)
