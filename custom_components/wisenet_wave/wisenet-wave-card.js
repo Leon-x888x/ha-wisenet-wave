@@ -2,7 +2,7 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-j geladen');
+console.info('[wisenet-wave-card] Version 2026-08-02-k geladen');
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -827,29 +827,20 @@ class WisenetWaveCard extends HTMLElement {
         this.errorEl.innerText = '';
         this._clearLoadWatchdog();
 
-        // Bug-Fix: Nicht der automatischen ABR-Qualitätswahl überlassen,
-        // welche Stufe initial genommen wird - das kann direkt nach dem
-        // Verbinden (bevor genug Bandbreitendaten vorliegen) oder nach
-        // vorherigen Fehlern (hls.js' "Penalty Box"-Mechanismus) auf einer
-        // deutlich kleineren/anderen Substream-Variante landen, z.B.
-        // 640x480 (4:3) statt der echten 16:9-Kameraauflösung - das
-        // erzeugt genau die schwarzen Balken links/rechts. Wir wählen
-        // stattdessen deterministisch die Stufe mit den meisten Pixeln.
+        // Diagnose: Die "meiste Pixel = richtige Stufe"-Annahme war falsch
+        // (die 4:3-Variante hat offenbar MEHR Pixel als die eigentlich
+        // gewünschte 16:9-Variante). Statt wieder zu raten, loggen wir hier
+        // erstmal ALLE verfügbaren Qualitätsstufen mit voller Auflösung +
+        // Bitrate, damit wir anhand echter Werte die richtige Stufe gezielt
+        // auswählen können - und lassen hls.js bis dahin wieder ganz normal
+        // per ABR automatisch wählen (kein erzwungenes currentLevel mehr).
         if (data?.levels?.length) {
-          let bestIdx = 0;
-          let bestPixels = -1;
-          data.levels.forEach((lvl, idx) => {
-            const pixels = (lvl.width || 0) * (lvl.height || 0);
-            if (pixels > bestPixels) {
-              bestPixels = pixels;
-              bestIdx = idx;
-            }
-          });
-          this.hls.currentLevel = bestIdx;
-          console.info(
-            `[wisenet-wave-card] ${data.levels.length} Qualitätsstufe(n) gefunden, wähle Stufe ${bestIdx} ` +
-            `(${data.levels[bestIdx].width}x${data.levels[bestIdx].height}) statt automatischer ABR-Wahl.`,
-          );
+          const levelInfo = data.levels
+            .map((lvl, idx) => `  [${idx}] ${lvl.width}x${lvl.height}, bitrate=${lvl.bitrate}, name=${lvl.name || lvl.attrs?.NAME || '-'}`)
+            .join('\n');
+          console.info(`[wisenet-wave-card] Verfügbare Qualitätsstufen:\n${levelInfo}`);
+        } else {
+          console.info('[wisenet-wave-card] Keine separaten Qualitätsstufen im Manifest gefunden (nur eine einzige Variante).');
         }
 
         this.videoEl.play().catch(() => {});
@@ -857,6 +848,15 @@ class WisenetWaveCard extends HTMLElement {
 
       this.hls.on(Hls.Events.ERROR, (event, data) => {
         this._handleHlsError(url, data, { ...options, token });
+      });
+
+      this.hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+        if (token !== this._activeStreamToken) return;
+        const lvl = this.hls?.levels?.[data.level];
+        console.info(
+          `[wisenet-wave-card] Qualitätsstufe gewechselt zu [${data.level}]` +
+          (lvl ? ` ${lvl.width}x${lvl.height}` : ''),
+        );
       });
     } else if (this.videoEl.canPlayType('application/vnd.apple.mpegurl')) {
       // Fallback für Apple Safari (Safari braucht oft keinen XHR Setup Trick, wenn Token als Cookie da ist,
