@@ -1,5 +1,6 @@
 """The Wisenet WAVE integration."""
 import os
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -26,10 +27,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # --- NEU: Frontend-Karte über die Integration hosten ---
     card_path = hass.config.path(f"custom_components/{DOMAIN}/wisenet-wave-card.js")
     if os.path.exists(card_path):
-        hass.http.register_static_path(
-            f"/{DOMAIN}_card/wisenet-wave-card.js",
-            card_path,
-            cache_headers=False
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(f"/{DOMAIN}_card/wisenet-wave-card.js", card_path, cache_headers=False)]
         )
     # -------------------------------------------------------
 
