@@ -1,3 +1,9 @@
+// Version-Marker: taucht in der Browser-Konsole auf. Wenn diese Zeile nach
+// einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
+// läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
+// die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
+console.info('[wisenet-wave-card] Version 2026-08-02-d geladen');
+
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
   setConfig(config) {
@@ -473,6 +479,10 @@ class WisenetWaveCard extends HTMLElement {
         const data = response?.response || { recording: [], motion: [] };
         this._periodsCache.set(key, data);
         this._pendingFetches.delete(key);
+        console.info(
+          `[wisenet-wave-card] Periods für ${key}: recording=${data.recording?.length ?? 0}, motion=${data.motion?.length ?? 0}, error=${data.error ?? 'keiner'}`,
+          data,
+        );
         if (data.error) {
           console.warn('wisenet_wave: Zeitleisten-Daten (Aufnahme/Bewegung) fehlgeschlagen:', data.error);
           if (!this._timelineErrorShown) {
