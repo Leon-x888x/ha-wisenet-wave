@@ -82,15 +82,16 @@ class WisenetWaveApiClient:
 
         periods_type: "recording" (durchgehende Aufnahme) oder "motion"
         (Bewegungserkennung). Nutzt den WAVE/Nx-Legacy-Endpunkt
-        ec2/recordedTimePeriods, der auf so gut wie allen WAVE-Server-
-        Versionen vorhanden ist. Liefert bei jedem Fehler (Server unterstützt
-        den Endpunkt nicht, Timeout, ...) einfach eine leere Liste zurück,
-        statt die ganze Karte crashen zu lassen - die Zeitleiste funktioniert
-        dann weiterhin zum Navigieren, zeigt nur keine Einfärbung an.
+        ec2/recordedTimePeriods.
+
+        Gibt immer ein Tupel (periods, error) zurück statt bei Fehlern
+        einfach still eine leere Liste zu liefern - so kann die Karte dem
+        Nutzer zeigen, WARUM keine Einfärbung da ist, statt nur grau zu
+        bleiben. Bei Erfolg ist error None.
         """
         headers = await self._get_headers()
         if not headers:
-            return []
+            return [], "Keine gültige Authentifizierung (Login fehlgeschlagen)"
 
         # "detail" fasst Chunks zusammen, die näher als X ms beieinander
         # liegen. Bei großen Zeitfenstern (mehrere Tage/Wochen) grob genug
@@ -113,22 +114,29 @@ class WisenetWaveApiClient:
                 url, headers=headers, params=params, timeout=15, ssl=False
             ) as response:
                 if response.status != 200:
-                    _LOGGER.debug(
-                        "recordedTimePeriods (%s) für %s antwortete mit Status %s",
-                        periods_type, camera_id, response.status,
+                    body_snippet = (await response.text())[:300]
+                    _LOGGER.warning(
+                        "wisenet_wave: recordedTimePeriods (%s) für Kamera %s antwortete mit "
+                        "HTTP %s. URL: %s | Antwort: %s",
+                        periods_type, camera_id, response.status, url, body_snippet,
                     )
-                    return []
+                    return [], f"HTTP {response.status} von {url}"
                 data = await response.json()
                 # "flat=true" liefert direkt eine Liste von {startTimeMs, durationMs}
                 if isinstance(data, list):
-                    return data
-                return []
+                    return data, None
+                _LOGGER.warning(
+                    "wisenet_wave: recordedTimePeriods (%s) für %s lieferte unerwartetes "
+                    "Format (kein JSON-Array): %s",
+                    periods_type, camera_id, str(data)[:300],
+                )
+                return [], "Unerwartetes Antwortformat vom WAVE-Server"
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug(
-                "Fehler beim Abrufen von recordedTimePeriods (%s) für %s: %s",
+            _LOGGER.warning(
+                "wisenet_wave: Fehler beim Abrufen von recordedTimePeriods (%s) für %s: %s",
                 periods_type, camera_id, err,
             )
-            return []
+            return [], str(err)
 
     def get_hls_archive_url(self, camera_id: str, timestamp_ms: int) -> str:
         """

@@ -74,14 +74,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         start_ms = call.data.get("start_ms")
         end_ms = call.data.get("end_ms")
 
-        recording, motion = await asyncio.gather(
+        (recording, rec_err), (motion, mot_err) = await asyncio.gather(
             client.async_get_recorded_periods(camera_id, start_ms, end_ms, "recording"),
             client.async_get_recorded_periods(camera_id, start_ms, end_ms, "motion"),
         )
+        error = rec_err or mot_err
 
         return {
             "recording": recording,
             "motion": motion,
+            "error": error,
         }
 
     hass.services.async_register(

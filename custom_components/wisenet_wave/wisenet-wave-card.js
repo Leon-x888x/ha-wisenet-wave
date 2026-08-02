@@ -17,6 +17,8 @@ class WisenetWaveCard extends HTMLElement {
     this._pinchState = null;
     this._fetchDebounce = null;
     this._rafId = null;
+    this._loadWatchdogId = null;
+    this._timelineErrorShown = false;
   }
 
   // Ermittelt die interne Wisenet-Kamera-ID: entweder direkt aus camera_id,
@@ -163,6 +165,29 @@ class WisenetWaveCard extends HTMLElement {
       this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:play');
       this._stopPlayheadLoop();
     });
+    this.videoEl.addEventListener('playing', () => this._clearLoadWatchdog());
+  }
+
+  // Verhindert einen dauerhaften Ladescreen, wenn für den angefragten
+  // Zeitpunkt gar kein Videomaterial existiert (z.B. Live-Sprung auf eine
+  // Kamera, die gerade nichts aufzeichnet). hls.js feuert in solchen Fällen
+  // oft weder MANIFEST_PARSED noch einen fatalen Error - der Player bleibt
+  // einfach ewig im Ladezustand hängen.
+  _startLoadWatchdog() {
+    this._clearLoadWatchdog();
+    this._loadWatchdogId = setTimeout(() => {
+      if (this.videoEl.readyState < 2) {
+        this.errorEl.innerText = 'Für diesen Zeitpunkt ist kein Video verfügbar.';
+        if (this.hls) { this.hls.destroy(); this.hls = null; }
+      }
+    }, 9000);
+  }
+
+  _clearLoadWatchdog() {
+    if (this._loadWatchdogId) {
+      clearTimeout(this._loadWatchdogId);
+      this._loadWatchdogId = null;
+    }
   }
 
   _startPlayheadLoop() {
@@ -210,6 +235,7 @@ class WisenetWaveCard extends HTMLElement {
       const deltaMs = (dx / rect.width) * span;
       this._viewStart = this._dragState.origStart - deltaMs;
       this._viewEnd = this._dragState.origEnd - deltaMs;
+      this._clampView();
       this._drawTimeline();
     });
     window.addEventListener('mouseup', (ev) => {
@@ -251,6 +277,7 @@ class WisenetWaveCard extends HTMLElement {
         const deltaMs = (dx / rect.width) * span;
         this._viewStart = this._dragState.origStart - deltaMs;
         this._viewEnd = this._dragState.origEnd - deltaMs;
+        this._clampView();
         this._drawTimeline();
       } else if (ev.touches.length === 2 && this._pinchState) {
         const dist = this._touchDist(ev.touches);
@@ -260,6 +287,7 @@ class WisenetWaveCard extends HTMLElement {
         const newSpan = this._clampSpan(span * factor);
         this._viewStart = center - newSpan / 2;
         this._viewEnd = center + newSpan / 2;
+        this._clampView();
         this._drawTimeline();
       }
     }, { passive: true });
@@ -293,6 +321,18 @@ class WisenetWaveCard extends HTMLElement {
     return Math.min(Math.max(span, MIN_SPAN), MAX_SPAN);
   }
 
+  // Verhindert, dass man den sichtbaren Bereich per Zoom/Pan komplett aus
+  // dem sinnvollen Bereich schiebt: nicht in die Zukunft über "jetzt"
+  // hinaus (da rechts davon sowieso nie Aufnahmen liegen können).
+  _clampView() {
+    const nowBuffer = Date.now() + 5000;
+    if (this._viewEnd > nowBuffer) {
+      const span = this._viewEnd - this._viewStart;
+      this._viewEnd = nowBuffer;
+      this._viewStart = nowBuffer - span;
+    }
+  }
+
   // factor < 1 = reinzoomen, factor > 1 = rauszoomen. anchorRatio (0..1):
   // Position im Canvas, die beim Zoom fix bleiben soll (null = Mitte).
   _zoomBy(factor, anchorRatio) {
@@ -302,6 +342,7 @@ class WisenetWaveCard extends HTMLElement {
     const newSpan = this._clampSpan(span * factor);
     this._viewStart = anchorTime - newSpan * ratio;
     this._viewEnd = this._viewStart + newSpan;
+    this._clampView();
     this._drawTimeline();
     this._scheduleFetch();
   }
@@ -355,6 +396,13 @@ class WisenetWaveCard extends HTMLElement {
         const data = response?.response || { recording: [], motion: [] };
         this._periodsCache.set(key, data);
         this._pendingFetches.delete(key);
+        if (data.error) {
+          console.warn('wisenet_wave: Zeitleisten-Daten (Aufnahme/Bewegung) fehlgeschlagen:', data.error);
+          if (!this._timelineErrorShown) {
+            this._timelineErrorShown = true;
+            this.errorEl.innerText = 'Aufnahme-/Bewegungsanzeige nicht verfügbar (Details im HA-Log unter "wisenet_wave").';
+          }
+        }
         this._drawTimeline();
       }).catch((err) => {
         console.warn('wisenet_wave: konnte Zeitleisten-Daten nicht laden', err);
@@ -491,6 +539,7 @@ class WisenetWaveCard extends HTMLElement {
       });
       const url = response.response.url;
       this._streamStartMs = timestampMs;
+      this._startLoadWatchdog();
       this.initHlsPlayer(url);
     } catch (err) {
       console.error(err);
@@ -524,6 +573,7 @@ class WisenetWaveCard extends HTMLElement {
 
       this.hls.on(Hls.Events.ERROR, (event, data) => {
         if (data.fatal) {
+          this._clearLoadWatchdog();
           this.errorEl.innerText = "HLS Fehler: " + data.type;
         }
       });
