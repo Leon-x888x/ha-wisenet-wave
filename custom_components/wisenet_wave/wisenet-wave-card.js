@@ -84,10 +84,10 @@ class WisenetWaveCard extends HTMLElement {
       });
 
       const url = response.response.url;
-      const token = response.response.token;
 
-      // 2. Video mit HLS.js abspielen und den Token einschmuggeln!
-      this.initHlsPlayer(url, token);
+      // 2. Video mit HLS.js abspielen. Die URL zeigt auf den HA-eigenen Proxy,
+      //    der Browser schickt automatisch das HA-Login-Cookie mit (gleiche Origin).
+      this.initHlsPlayer(url);
 
     } catch (err) {
       console.error(err);
@@ -95,7 +95,7 @@ class WisenetWaveCard extends HTMLElement {
     }
   }
 
-  async initHlsPlayer(url, token) {
+  async initHlsPlayer(url) {
     // Dynamisches Laden der HLS.js Bibliothek
     if (!window.Hls) {
       await new Promise((resolve) => {
@@ -111,12 +111,7 @@ class WisenetWaveCard extends HTMLElement {
         this.hls.destroy(); // Alten Stream beenden
       }
 
-      this.hls = new Hls({
-        // HIER PASSIERT DIE MAGIE: Wir injizieren den Bearer-Token in jede Netzwerkanfrage!
-        xhrSetup: function (xhr, url) {
-          xhr.setRequestHeader('Authorization', 'Bearer ' + token);
-        }
-      });
+      this.hls = new Hls();
 
       this.hls.loadSource(url);
       this.hls.attachMedia(this.videoEl);

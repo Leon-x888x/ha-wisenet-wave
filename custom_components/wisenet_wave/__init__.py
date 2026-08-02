@@ -7,6 +7,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import DOMAIN, CONF_HOST, CONF_PORT, CONF_USERNAME, CONF_PASSWORD
 from .api import WisenetWaveApiClient
+from .proxy import WisenetWaveProxyView
 
 PLATFORMS = ["camera"]
 
@@ -24,6 +25,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = client
 
+    # --- Proxy-View einmalig registrieren, damit Geräte nur mit HA sprechen ---
+    if not hass.data[DOMAIN].get("_proxy_registered"):
+        hass.http.register_view(WisenetWaveProxyView(hass))
+        hass.data[DOMAIN]["_proxy_registered"] = True
+    # ---------------------------------------------------------------------
+
     # --- NEU: Frontend-Karte über die Integration hosten ---
     card_path = hass.config.path(f"custom_components/{DOMAIN}/wisenet-wave-card.js")
     if os.path.exists(card_path):
@@ -40,13 +47,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         camera_id = call.data.get("camera_id")
         import time
         timestamp_ms = call.data.get("timestamp_ms", int(time.time() * 1000))
-        
-        url = f"https://{client.host}:{client.port}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
-        token = client._token
-        
+
+        # URL zeigt jetzt auf unseren eigenen HA-Proxy, nicht direkt auf den WAVE-Server.
+        # Das Gerät des Nutzers spricht damit nur noch mit Home Assistant.
+        proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
+
         return {
-            "url": url,
-            "token": token
+            "url": proxy_url
         }
 
     hass.services.async_register(
