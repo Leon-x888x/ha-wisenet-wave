@@ -19,6 +19,11 @@ class WisenetWaveCard extends HTMLElement {
     this._rafId = null;
     this._loadWatchdogId = null;
     this._timelineErrorShown = false;
+    this._hlsRetryTimer = null;
+    this._hlsRetryCount = 0;
+    this._activeStreamToken = 0;
+    this._currentStreamUrl = null;
+    this._streamMode = 'archive';
   }
 
   // Ermittelt die interne Wisenet-Kamera-ID: entweder direkt aus camera_id,
@@ -148,7 +153,7 @@ class WisenetWaveCard extends HTMLElement {
       const span = this._viewEnd - this._viewStart;
       this._viewEnd = now;
       this._viewStart = now - span;
-      this.seekTo(now);
+      this.seekTo(now, { isLive: true });
       this._scheduleFetch();
       this._drawTimeline();
     });
@@ -519,10 +524,15 @@ class WisenetWaveCard extends HTMLElement {
 
   // ---------- Wiedergabe ----------
 
-  async seekTo(timestampMs) {
+  async seekTo(timestampMs, options = {}) {
     this.errorEl.innerText = '';
     this._playheadMs = timestampMs;
-    this._isLive = Math.abs(Date.now() - timestampMs) < 15000;
+    this._isLive = options.isLive === true || Math.abs(Date.now() - timestampMs) < 15000;
+    this._streamMode = this._isLive ? 'live' : 'archive';
+    this._hlsRetryCount = 0;
+    this._clearHlsRetry();
+    this._activeStreamToken += 1;
+    this._currentStreamUrl = null;
     this._updateTimeLabel();
     this._drawTimeline();
 
@@ -534,20 +544,57 @@ class WisenetWaveCard extends HTMLElement {
         type: 'call_service',
         domain: 'wisenet_wave',
         service: 'get_archive',
-        service_data: { camera_id: camId, timestamp_ms: Math.round(timestampMs) },
+        service_data: {
+          camera_id: camId,
+          timestamp_ms: Math.round(timestampMs),
+          stream_mode: this._streamMode,
+        },
         return_response: true,
       });
       const url = response.response.url;
-      this._streamStartMs = timestampMs;
+      this._currentStreamUrl = url;
+      this._streamStartMs = this._isLive ? Date.now() : timestampMs;
       this._startLoadWatchdog();
-      this.initHlsPlayer(url);
+      this.initHlsPlayer(url, { mode: this._streamMode, token: this._activeStreamToken });
     } catch (err) {
       console.error(err);
-      this.errorEl.innerText = 'Fehler beim Abrufen der Archiv-URL. Siehe Konsole.';
+      this.errorEl.innerText = 'Fehler beim Abrufen der Stream-URL. Siehe Konsole.';
     }
   }
 
-  async initHlsPlayer(url) {
+  _clearHlsRetry() {
+    if (this._hlsRetryTimer) {
+      clearTimeout(this._hlsRetryTimer);
+      this._hlsRetryTimer = null;
+    }
+  }
+
+  _handleHlsError(url, data, options = {}) {
+    const token = options.token ?? this._activeStreamToken;
+    if (token !== this._activeStreamToken) return;
+
+    const details = data?.details || '';
+    const isNetworkIssue = details.includes('NETWORK_ERROR') || details.includes('MEDIA_ERROR') || details.includes('MANIFEST_LOAD_ERROR') || details.includes('LEVEL_LOAD_ERROR');
+    const shouldRetry = (data?.fatal || isNetworkIssue) && this._hlsRetryCount < 3;
+
+    if (shouldRetry) {
+      this._hlsRetryCount += 1;
+      this._clearLoadWatchdog();
+      this.errorEl.innerText = `Stream vorübergehend nicht verfügbar, versuche erneut (${this._hlsRetryCount}/3)...`;
+      this._hlsRetryTimer = setTimeout(() => {
+        this._hlsRetryTimer = null;
+        this.initHlsPlayer(url, options);
+      }, 1000 * this._hlsRetryCount);
+      return;
+    }
+
+    this._clearLoadWatchdog();
+    this.errorEl.innerText = `HLS Fehler: ${data?.type || details || 'network error'}`;
+  }
+
+  async initHlsPlayer(url, options = {}) {
+    const token = options.token ?? this._activeStreamToken;
+
     // Dynamisches Laden der HLS.js Bibliothek
     if (!window.Hls) {
       await new Promise((resolve) => {
@@ -558,30 +605,37 @@ class WisenetWaveCard extends HTMLElement {
       });
     }
 
+    if (token !== this._activeStreamToken) return;
+
     if (Hls.isSupported()) {
       if (this.hls) {
         this.hls.destroy(); // Alten Stream beenden
       }
 
-      this.hls = new Hls();
+      this.hls = new Hls({
+        liveSyncDurationCount: 3,
+        maxBufferLength: 20,
+        maxBufferHole: 1.5,
+        liveDurationInfinity: options.mode === 'live',
+      });
 
       this.hls.loadSource(url);
       this.hls.attachMedia(this.videoEl);
       this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        this.videoEl.play();
+        if (token !== this._activeStreamToken) return;
+        this.errorEl.innerText = '';
+        this._clearLoadWatchdog();
+        this.videoEl.play().catch(() => {});
       });
 
       this.hls.on(Hls.Events.ERROR, (event, data) => {
-        if (data.fatal) {
-          this._clearLoadWatchdog();
-          this.errorEl.innerText = "HLS Fehler: " + data.type;
-        }
+        this._handleHlsError(url, data, { ...options, token });
       });
     } else if (this.videoEl.canPlayType('application/vnd.apple.mpegurl')) {
       // Fallback für Apple Safari (Safari braucht oft keinen XHR Setup Trick, wenn Token als Cookie da ist,
       // aber wir probieren es trotzdem, falls Safari nativ spielt).
       this.videoEl.src = url;
-      this.videoEl.play();
+      this.videoEl.play().catch(() => {});
     }
   }
 

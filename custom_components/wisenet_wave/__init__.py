@@ -55,11 +55,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Das Gerät des Nutzers spricht damit nur noch mit Home Assistant.
         # Signierte URL statt Auth-Header: das ist der HA-Standardweg für sowas
         # (genau wie bei den eingebauten Kamera-/Snapshot-URLs).
-        proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
+        stream_mode = call.data.get("stream_mode", "archive")
+        if stream_mode == "live":
+            proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8"
+        else:
+            proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
         signed_url = async_sign_path(hass, proxy_url, timedelta(hours=2))
 
         return {
-            "url": signed_url
+            "url": signed_url,
+            "mode": stream_mode,
         }
 
     hass.services.async_register(

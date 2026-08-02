@@ -34,7 +34,6 @@ class WisenetWaveProxyView(HomeAssistantView):
         if client is None:
             return web.Response(status=404, text="Unknown Wisenet WAVE entry")
 
-        headers = await client._get_headers()
         target_url = f"{client.base_url}/{path}"
 
         # Strip HA's own signed-URL params (authSig is only meant for HA's
@@ -49,20 +48,29 @@ class WisenetWaveProxyView(HomeAssistantView):
         if upstream_params:
             target_url += f"?{urllib.parse.urlencode(upstream_params)}"
 
-        try:
-            async with client.session.get(
-                target_url, headers=headers, ssl=False, timeout=15
-            ) as resp:
-                body = await resp.read()
-                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        for attempt in range(2):
+            headers = await client._get_headers(force_refresh=attempt > 0)
+            try:
+                async with client.session.get(
+                    target_url, headers=headers, ssl=False, timeout=15
+                ) as resp:
+                    if resp.status in (401, 403) and attempt == 0:
+                        client._token = None
+                        client._token_expires_at = 0
+                        continue
 
-                if path.endswith(".m3u8"):
-                    body = self._rewrite_playlist(body, entry_id)
+                    body = await resp.read()
+                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
 
-                return web.Response(body=body, status=resp.status, content_type=content_type)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Wisenet WAVE proxy error for %s: %s", target_url, err)
-            return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
+                    if path.endswith(".m3u8"):
+                        body = self._rewrite_playlist(body, entry_id)
+
+                    return web.Response(body=body, status=resp.status, content_type=content_type)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Wisenet WAVE proxy error for %s: %s", target_url, err)
+                return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
+
+        return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
 
     def _rewrite_playlist(self, body: bytes, entry_id: str) -> bytes:
         """Rewrite segment/sub-playlist URIs in an m3u8 to point back through the proxy.

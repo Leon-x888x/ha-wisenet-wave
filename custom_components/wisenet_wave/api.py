@@ -1,6 +1,7 @@
 """API Client for Wisenet WAVE using Bearer Token Authentication."""
 import aiohttp
 import logging
+import time
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -13,6 +14,7 @@ class WisenetWaveApiClient:
         self.session = session
         self.base_url = f"https://{host}:{port}"
         self._token = None
+        self._token_expires_at = 0
 
     async def async_login(self) -> bool:
         """Authenticate with Wisenet WAVE 6.x and retrieve a Bearer token."""
@@ -21,13 +23,14 @@ class WisenetWaveApiClient:
             "username": self.username,
             "password": self.password
         }
-        
+
         try:
             async with self.session.post(url, json=payload, timeout=10, ssl=False) as response:
                 if response.status in (200, 201):
                     data = await response.json()
                     self._token = data.get("token")
                     if self._token:
+                        self._token_expires_at = time.time() + 55 * 60
                         return True
                     return False
                 return False
@@ -35,9 +38,9 @@ class WisenetWaveApiClient:
             _LOGGER.error("Error logging in to Wisenet WAVE: %s", err)
             return False
 
-    async def _get_headers(self) -> dict:
+    async def _get_headers(self, force_refresh: bool = False) -> dict:
         """Ensure we have a valid token and return authorization headers."""
-        if not self._token:
+        if force_refresh or not self._token or time.time() >= self._token_expires_at:
             await self.async_login()
         if self._token:
             return {"Authorization": f"Bearer {self._token}"}
@@ -89,10 +92,6 @@ class WisenetWaveApiClient:
         Nutzer zeigen, WARUM keine Einfärbung da ist, statt nur grau zu
         bleiben. Bei Erfolg ist error None.
         """
-        headers = await self._get_headers()
-        if not headers:
-            return [], "Keine gültige Authentifizierung (Login fehlgeschlagen)"
-
         # "detail" fasst Chunks zusammen, die näher als X ms beieinander
         # liegen. Bei großen Zeitfenstern (mehrere Tage/Wochen) grob genug
         # wählen, damit die Antwort nicht ausufert.
@@ -109,34 +108,49 @@ class WisenetWaveApiClient:
             "detail": str(detail),
             "periodsType": periods_type,
         }
-        try:
-            async with self.session.get(
-                url, headers=headers, params=params, timeout=15, ssl=False
-            ) as response:
-                if response.status != 200:
-                    body_snippet = (await response.text())[:300]
+        for attempt in range(2):
+            headers = await self._get_headers(force_refresh=attempt > 0)
+            if not headers:
+                return [], "Keine gültige Authentifizierung (Login fehlgeschlagen)"
+
+            try:
+                async with self.session.get(
+                    url, headers=headers, params=params, timeout=15, ssl=False
+                ) as response:
+                    if response.status in (401, 403):
+                        self._token = None
+                        self._token_expires_at = 0
+                        _LOGGER.warning(
+                            "wisenet_wave: Token für recordedTimePeriods (%s) für %s ungültig, versuche erneut",
+                            periods_type, camera_id,
+                        )
+                        continue
+                    if response.status != 200:
+                        body_snippet = (await response.text())[:300]
+                        _LOGGER.warning(
+                            "wisenet_wave: recordedTimePeriods (%s) für Kamera %s antwortete mit "
+                            "HTTP %s. URL: %s | Antwort: %s",
+                            periods_type, camera_id, response.status, url, body_snippet,
+                        )
+                        return [], f"HTTP {response.status} von {url}"
+                    data = await response.json()
+                    # "flat=true" liefert direkt eine Liste von {startTimeMs, durationMs}
+                    if isinstance(data, list):
+                        return data, None
                     _LOGGER.warning(
-                        "wisenet_wave: recordedTimePeriods (%s) für Kamera %s antwortete mit "
-                        "HTTP %s. URL: %s | Antwort: %s",
-                        periods_type, camera_id, response.status, url, body_snippet,
+                        "wisenet_wave: recordedTimePeriods (%s) für %s lieferte unerwartetes "
+                        "Format (kein JSON-Array): %s",
+                        periods_type, camera_id, str(data)[:300],
                     )
-                    return [], f"HTTP {response.status} von {url}"
-                data = await response.json()
-                # "flat=true" liefert direkt eine Liste von {startTimeMs, durationMs}
-                if isinstance(data, list):
-                    return data, None
+                    return [], "Unerwartetes Antwortformat vom WAVE-Server"
+            except Exception as err:  # noqa: BLE001
                 _LOGGER.warning(
-                    "wisenet_wave: recordedTimePeriods (%s) für %s lieferte unerwartetes "
-                    "Format (kein JSON-Array): %s",
-                    periods_type, camera_id, str(data)[:300],
+                    "wisenet_wave: Fehler beim Abrufen von recordedTimePeriods (%s) für %s: %s",
+                    periods_type, camera_id, err,
                 )
-                return [], "Unerwartetes Antwortformat vom WAVE-Server"
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning(
-                "wisenet_wave: Fehler beim Abrufen von recordedTimePeriods (%s) für %s: %s",
-                periods_type, camera_id, err,
-            )
-            return [], str(err)
+                return [], str(err)
+
+        return [], "Keine gültige Authentifizierung (Login fehlgeschlagen)"
 
     def get_hls_archive_url(self, camera_id: str, timestamp_ms: int) -> str:
         """
