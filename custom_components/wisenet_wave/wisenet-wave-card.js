@@ -55,6 +55,7 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-content { padding: 0 16px 16px; }
             .wwc-video-wrap { position: relative; width: 100%; background: #000; border-radius: 4px; overflow: hidden; }
             .wwc-video-wrap video { width: 100%; display: block; }
+            .wwc-video-wrap video.wwc-live-no-controls { cursor: default; }
             .wwc-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
             .wwc-btn {
               display: flex; align-items: center; justify-content: center;
@@ -63,6 +64,7 @@ class WisenetWaveCard extends HTMLElement {
               cursor: pointer;
             }
             .wwc-btn:hover { background: var(--divider-color, rgba(0,0,0,0.08)); }
+            .wwc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
             .wwc-btn ha-icon { --mdc-icon-size: 20px; }
             .wwc-time { font-family: var(--code-font-family, monospace); font-size: 13px; color: var(--secondary-text-color); min-width: 148px; }
             .wwc-spacer { flex: 1; }
@@ -126,6 +128,7 @@ class WisenetWaveCard extends HTMLElement {
       this._setupTransportControls();
       this._setupTimelineInteraction();
       this._setupVideoEvents();
+      this._syncVideoUi();
 
       // Erste Darstellung + initiale Daten laden
       this._resizeCanvas();
@@ -193,6 +196,19 @@ class WisenetWaveCard extends HTMLElement {
       clearTimeout(this._loadWatchdogId);
       this._loadWatchdogId = null;
     }
+  }
+
+  _syncVideoUi() {
+    const isLive = this._streamMode === 'live' || this._isLive;
+    this.videoEl.controls = !isLive;
+    this.videoEl.classList.toggle('wwc-live-no-controls', isLive);
+
+    const skipBackBtn = this.querySelector('#wave-skip-back');
+    const skipFwdBtn = this.querySelector('#wave-skip-fwd');
+    skipBackBtn.disabled = isLive;
+    skipFwdBtn.disabled = isLive;
+    this.playPauseBtnEl.disabled = isLive;
+    this.playPauseBtnEl.setAttribute('title', isLive ? 'Live-Ansicht pausieren nicht verfügbar' : 'Abspielen/Pause');
   }
 
   _startPlayheadLoop() {
@@ -529,6 +545,7 @@ class WisenetWaveCard extends HTMLElement {
     this._playheadMs = timestampMs;
     this._isLive = options.isLive === true || Math.abs(Date.now() - timestampMs) < 15000;
     this._streamMode = this._isLive ? 'live' : 'archive';
+    this._syncVideoUi();
     this._hlsRetryCount = 0;
     this._clearHlsRetry();
     this._activeStreamToken += 1;
