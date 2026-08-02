@@ -1,4 +1,5 @@
 """The Wisenet WAVE integration."""
+import asyncio
 import os
 from datetime import timedelta
 from homeassistant.components.http import StaticPathConfig
@@ -65,6 +66,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DOMAIN, "get_archive", handle_get_archive, supports_response=True
     )
     # ---------------------------------------------------------
+
+    # --- NEU: Service für die Zeitleisten-Einfärbung (Aufnahme/Bewegung) ---
+    async def handle_get_timeline(call: ServiceCall):
+        """Handler für den wisenet_wave.get_timeline Service."""
+        camera_id = call.data.get("camera_id")
+        start_ms = call.data.get("start_ms")
+        end_ms = call.data.get("end_ms")
+
+        recording, motion = await asyncio.gather(
+            client.async_get_recorded_periods(camera_id, start_ms, end_ms, "recording"),
+            client.async_get_recorded_periods(camera_id, start_ms, end_ms, "motion"),
+        )
+
+        return {
+            "recording": recording,
+            "motion": motion,
+        }
+
+    hass.services.async_register(
+        DOMAIN, "get_timeline", handle_get_timeline, supports_response=True
+    )
+    # -----------------------------------------------------------------
 
     return True
 

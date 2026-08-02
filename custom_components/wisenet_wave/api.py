@@ -74,6 +74,62 @@ class WisenetWaveApiClient:
             _LOGGER.error("Error fetching cameras: %s", err)
             return []
 
+    async def async_get_recorded_periods(
+        self, camera_id: str, start_ms: int, end_ms: int, periods_type: str = "recording"
+    ) -> list:
+        """
+        Holt Aufnahme- bzw. Bewegungs-Zeiträume für eine Kamera in einem Zeitfenster.
+
+        periods_type: "recording" (durchgehende Aufnahme) oder "motion"
+        (Bewegungserkennung). Nutzt den WAVE/Nx-Legacy-Endpunkt
+        ec2/recordedTimePeriods, der auf so gut wie allen WAVE-Server-
+        Versionen vorhanden ist. Liefert bei jedem Fehler (Server unterstützt
+        den Endpunkt nicht, Timeout, ...) einfach eine leere Liste zurück,
+        statt die ganze Karte crashen zu lassen - die Zeitleiste funktioniert
+        dann weiterhin zum Navigieren, zeigt nur keine Einfärbung an.
+        """
+        headers = await self._get_headers()
+        if not headers:
+            return []
+
+        # "detail" fasst Chunks zusammen, die näher als X ms beieinander
+        # liegen. Bei großen Zeitfenstern (mehrere Tage/Wochen) grob genug
+        # wählen, damit die Antwort nicht ausufert.
+        span_ms = max(end_ms - start_ms, 1)
+        detail = max(60_000, min(span_ms // 1000, 3_600_000))
+
+        url = f"{self.base_url}/ec2/recordedTimePeriods"
+        params = {
+            "cameraId": camera_id,
+            "startTime": str(start_ms),
+            "endTime": str(end_ms),
+            "format": "json",
+            "flat": "true",
+            "detail": str(detail),
+            "periodsType": periods_type,
+        }
+        try:
+            async with self.session.get(
+                url, headers=headers, params=params, timeout=15, ssl=False
+            ) as response:
+                if response.status != 200:
+                    _LOGGER.debug(
+                        "recordedTimePeriods (%s) für %s antwortete mit Status %s",
+                        periods_type, camera_id, response.status,
+                    )
+                    return []
+                data = await response.json()
+                # "flat=true" liefert direkt eine Liste von {startTimeMs, durationMs}
+                if isinstance(data, list):
+                    return data
+                return []
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "Fehler beim Abrufen von recordedTimePeriods (%s) für %s: %s",
+                periods_type, camera_id, err,
+            )
+            return []
+
     def get_hls_archive_url(self, camera_id: str, timestamp_ms: int) -> str:
         """
         Generiert die HLS-Stream-URL für eine bestimmte Zeit.

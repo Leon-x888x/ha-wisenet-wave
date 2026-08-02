@@ -5,6 +5,18 @@ class WisenetWaveCard extends HTMLElement {
       throw new Error('Du musst entweder "entity" (z.B. camera.terrasse) oder "camera_id" angeben!');
     }
     this.config = config;
+
+    // Zeitleisten-Zustand
+    this._viewEnd = Date.now();
+    this._viewStart = this._viewEnd - 60 * 60 * 1000; // Start: letzte Stunde
+    this._playheadMs = this._viewEnd;
+    this._isLive = false;
+    this._periodsCache = new Map(); // Tagesschlüssel -> {recording:[], motion:[]}
+    this._pendingFetches = new Set();
+    this._dragState = null;
+    this._pinchState = null;
+    this._fetchDebounce = null;
+    this._rafId = null;
   }
 
   // Ermittelt die interne Wisenet-Kamera-ID: entweder direkt aus camera_id,
@@ -32,66 +44,457 @@ class WisenetWaveCard extends HTMLElement {
     if (!this.content) {
       this.innerHTML = `
         <ha-card header="${this.config.title || 'Wisenet WAVE Archiv'}">
-          <div class="card-content">
-            <video id="wave-video" controls muted style="width: 100%; background: #000; border-radius: 4px;"></video>
-            
-            <div style="margin-top: 16px; display: flex; gap: 8px; align-items: center;">
-              <input type="datetime-local" id="wave-time" style="padding: 8px; flex-grow: 1; border-radius: 4px; border: 1px solid #ccc;">
-              <button id="wave-play" style="padding: 8px 16px; cursor: pointer; background: var(--primary-color); color: white; border: none; border-radius: 4px;">Abspielen</button>
+          <style>
+            .wwc-content { padding: 0 16px 16px; }
+            .wwc-video-wrap { position: relative; width: 100%; background: #000; border-radius: 4px; overflow: hidden; }
+            .wwc-video-wrap video { width: 100%; display: block; }
+            .wwc-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+            .wwc-btn {
+              display: flex; align-items: center; justify-content: center;
+              width: 32px; height: 32px; padding: 0; border-radius: 50%;
+              border: none; background: transparent; color: var(--primary-text-color);
+              cursor: pointer;
+            }
+            .wwc-btn:hover { background: var(--divider-color, rgba(0,0,0,0.08)); }
+            .wwc-btn ha-icon { --mdc-icon-size: 20px; }
+            .wwc-time { font-family: var(--code-font-family, monospace); font-size: 13px; color: var(--secondary-text-color); min-width: 148px; }
+            .wwc-spacer { flex: 1; }
+            .wwc-live-btn {
+              font-size: 12px; font-weight: 500; padding: 4px 10px; border-radius: 12px;
+              border: 1px solid var(--divider-color); background: none; cursor: pointer;
+              color: var(--secondary-text-color); display: flex; align-items: center; gap: 4px;
+            }
+            .wwc-live-btn.active { color: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
+            .wwc-live-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+            .wwc-timeline-wrap { margin-top: 10px; }
+            .wwc-timeline-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--secondary-text-color); padding: 0 2px 2px; height: 12px; }
+            .wwc-canvas { width: 100%; height: 46px; display: block; border-radius: 4px; cursor: pointer; touch-action: none; background: var(--divider-color, #e0e0e0); }
+            .wwc-legend { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; }
+            .wwc-legend-items { display: flex; gap: 14px; font-size: 11px; color: var(--secondary-text-color); }
+            .wwc-legend-dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 4px; vertical-align: -1px; }
+            .wwc-zoom-controls { display: flex; gap: 4px; }
+          </style>
+          <div class="card-content wwc-content">
+            <div class="wwc-video-wrap">
+              <video id="wave-video" controls muted playsinline></video>
             </div>
-            <div id="wave-error" style="color: red; margin-top: 8px; font-size: 12px;"></div>
+
+            <div class="wwc-toolbar">
+              <button class="wwc-btn" id="wave-skip-back" title="10s zurück"><ha-icon icon="mdi:rewind-10"></ha-icon></button>
+              <button class="wwc-btn" id="wave-play-pause" title="Abspielen/Pause"><ha-icon icon="mdi:play"></ha-icon></button>
+              <button class="wwc-btn" id="wave-skip-fwd" title="10s vor"><ha-icon icon="mdi:fast-forward-10"></ha-icon></button>
+              <span class="wwc-time" id="wave-time-label">--</span>
+              <div class="wwc-spacer"></div>
+              <button class="wwc-live-btn" id="wave-live-btn"><span class="wwc-live-dot"></span>Live</button>
+            </div>
+
+            <div class="wwc-timeline-wrap">
+              <div class="wwc-timeline-labels" id="wave-timeline-labels"></div>
+              <canvas class="wwc-canvas" id="wave-canvas" height="46"></canvas>
+              <div class="wwc-legend">
+                <div class="wwc-legend-items">
+                  <span><span class="wwc-legend-dot" style="background:var(--success-color,#43a047)"></span>Aufnahme</span>
+                  <span><span class="wwc-legend-dot" style="background:var(--error-color,#db4437)"></span>Bewegung</span>
+                </div>
+                <div class="wwc-zoom-controls">
+                  <button class="wwc-btn" id="wave-zoom-out" title="Rauszoomen"><ha-icon icon="mdi:magnify-minus-outline"></ha-icon></button>
+                  <button class="wwc-btn" id="wave-zoom-in" title="Reinzoomen"><ha-icon icon="mdi:magnify-plus-outline"></ha-icon></button>
+                </div>
+              </div>
+            </div>
+
+            <div id="wave-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
           </div>
         </ha-card>
       `;
       this.content = this.querySelector('.card-content');
       this.videoEl = this.querySelector('#wave-video');
-      this.timeInputEl = this.querySelector('#wave-time');
       this.errorEl = this.querySelector('#wave-error');
-      
-      // Klick-Event für den Play-Button
-      this.querySelector('#wave-play').addEventListener('click', () => this.playArchive());
+      this.canvasEl = this.querySelector('#wave-canvas');
+      this.labelsEl = this.querySelector('#wave-timeline-labels');
+      this.timeLabelEl = this.querySelector('#wave-time-label');
+      this.liveBtnEl = this.querySelector('#wave-live-btn');
+      this.playPauseBtnEl = this.querySelector('#wave-play-pause');
+
+      this._setupTransportControls();
+      this._setupTimelineInteraction();
+      this._setupVideoEvents();
+
+      // Erste Darstellung + initiale Daten laden
+      this._resizeCanvas();
+      this._scheduleFetch();
+      this._updateTimeLabel();
+      this._drawTimeline();
+
+      window.addEventListener('resize', () => { this._resizeCanvas(); this._drawTimeline(); });
     }
   }
 
-  async playArchive() {
-    this.errorEl.innerText = ""; // Fehler zurücksetzen
-    const timeValue = this.timeInputEl.value;
-    
-    if (!timeValue) {
-      this.errorEl.innerText = "Bitte wähle zuerst ein Datum und eine Uhrzeit aus.";
-      return;
+  _setupTransportControls() {
+    this.querySelector('#wave-play-pause').addEventListener('click', () => {
+      if (this.videoEl.paused) { this.videoEl.play(); } else { this.videoEl.pause(); }
+    });
+    this.querySelector('#wave-skip-back').addEventListener('click', () => {
+      this.seekTo(this._playheadMs - 10000);
+    });
+    this.querySelector('#wave-skip-fwd').addEventListener('click', () => {
+      this.seekTo(this._playheadMs + 10000);
+    });
+    this.liveBtnEl.addEventListener('click', () => {
+      const now = Date.now();
+      this._isLive = true;
+      const span = this._viewEnd - this._viewStart;
+      this._viewEnd = now;
+      this._viewStart = now - span;
+      this.seekTo(now);
+      this._scheduleFetch();
+      this._drawTimeline();
+    });
+    this.querySelector('#wave-zoom-in').addEventListener('click', () => this._zoomBy(0.5, null));
+    this.querySelector('#wave-zoom-out').addEventListener('click', () => this._zoomBy(2, null));
+  }
+
+  _setupVideoEvents() {
+    this.videoEl.addEventListener('play', () => {
+      this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:pause');
+      this._startPlayheadLoop();
+    });
+    this.videoEl.addEventListener('pause', () => {
+      this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:play');
+      this._stopPlayheadLoop();
+    });
+  }
+
+  _startPlayheadLoop() {
+    if (this._rafId) return;
+    const tick = () => {
+      if (this._streamStartMs != null && !this.videoEl.paused) {
+        this._playheadMs = this._streamStartMs + this.videoEl.currentTime * 1000;
+        this._updateTimeLabel();
+        this._drawTimeline();
+      }
+      this._rafId = requestAnimationFrame(tick);
+    };
+    this._rafId = requestAnimationFrame(tick);
+  }
+
+  _stopPlayheadLoop() {
+    if (this._rafId) {
+      cancelAnimationFrame(this._rafId);
+      this._rafId = null;
     }
+  }
+
+  // ---------- Zeitleisten-Interaktion (Zoom / Pan / Klick) ----------
+
+  _setupTimelineInteraction() {
+    const canvas = this.canvasEl;
+
+    canvas.addEventListener('wheel', (ev) => {
+      ev.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const factor = ev.deltaY > 0 ? 1.3 : 1 / 1.3;
+      this._zoomBy(factor, x / rect.width);
+    }, { passive: false });
+
+    canvas.addEventListener('mousedown', (ev) => {
+      this._dragState = { startX: ev.clientX, moved: false, origStart: this._viewStart, origEnd: this._viewEnd };
+    });
+    window.addEventListener('mousemove', (ev) => {
+      if (!this._dragState) return;
+      const dx = ev.clientX - this._dragState.startX;
+      if (Math.abs(dx) > 3) this._dragState.moved = true;
+      const rect = canvas.getBoundingClientRect();
+      const span = this._dragState.origEnd - this._dragState.origStart;
+      const deltaMs = (dx / rect.width) * span;
+      this._viewStart = this._dragState.origStart - deltaMs;
+      this._viewEnd = this._dragState.origEnd - deltaMs;
+      this._drawTimeline();
+    });
+    window.addEventListener('mouseup', (ev) => {
+      if (!this._dragState) return;
+      const wasDrag = this._dragState.moved;
+      this._dragState = null;
+      this._scheduleFetch();
+      if (!wasDrag) {
+        const rect = canvas.getBoundingClientRect();
+        const x = ev.clientX - rect.left;
+        if (x >= 0 && x <= rect.width) {
+          const t = this._viewStart + (x / rect.width) * (this._viewEnd - this._viewStart);
+          this.seekTo(t);
+        }
+      }
+    });
+
+    // Touch: 1 Finger = Pan/Klick, 2 Finger = Pinch-Zoom
+    canvas.addEventListener('touchstart', (ev) => {
+      if (ev.touches.length === 1) {
+        const t = ev.touches[0];
+        this._dragState = { startX: t.clientX, moved: false, origStart: this._viewStart, origEnd: this._viewEnd };
+      } else if (ev.touches.length === 2) {
+        this._dragState = null;
+        this._pinchState = {
+          startDist: this._touchDist(ev.touches),
+          origStart: this._viewStart,
+          origEnd: this._viewEnd,
+        };
+      }
+    }, { passive: true });
+
+    canvas.addEventListener('touchmove', (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      if (ev.touches.length === 1 && this._dragState) {
+        const dx = ev.touches[0].clientX - this._dragState.startX;
+        if (Math.abs(dx) > 3) this._dragState.moved = true;
+        const span = this._dragState.origEnd - this._dragState.origStart;
+        const deltaMs = (dx / rect.width) * span;
+        this._viewStart = this._dragState.origStart - deltaMs;
+        this._viewEnd = this._dragState.origEnd - deltaMs;
+        this._drawTimeline();
+      } else if (ev.touches.length === 2 && this._pinchState) {
+        const dist = this._touchDist(ev.touches);
+        const factor = this._pinchState.startDist / Math.max(dist, 1);
+        const span = this._pinchState.origEnd - this._pinchState.origStart;
+        const center = this._pinchState.origStart + span / 2;
+        const newSpan = this._clampSpan(span * factor);
+        this._viewStart = center - newSpan / 2;
+        this._viewEnd = center + newSpan / 2;
+        this._drawTimeline();
+      }
+    }, { passive: true });
+
+    canvas.addEventListener('touchend', (ev) => {
+      if (ev.touches.length === 0) {
+        const wasDrag = this._dragState && this._dragState.moved;
+        const dragState = this._dragState;
+        this._dragState = null;
+        this._pinchState = null;
+        this._scheduleFetch();
+        if (dragState && !wasDrag && ev.changedTouches.length) {
+          const rect = canvas.getBoundingClientRect();
+          const x = ev.changedTouches[0].clientX - rect.left;
+          const t = this._viewStart + (x / rect.width) * (this._viewEnd - this._viewStart);
+          this.seekTo(t);
+        }
+      }
+    });
+  }
+
+  _touchDist(touches) {
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  _clampSpan(span) {
+    const MIN_SPAN = 5 * 60 * 1000;        // 5 Minuten
+    const MAX_SPAN = 60 * 24 * 60 * 60 * 1000; // 60 Tage
+    return Math.min(Math.max(span, MIN_SPAN), MAX_SPAN);
+  }
+
+  // factor < 1 = reinzoomen, factor > 1 = rauszoomen. anchorRatio (0..1):
+  // Position im Canvas, die beim Zoom fix bleiben soll (null = Mitte).
+  _zoomBy(factor, anchorRatio) {
+    const span = this._viewEnd - this._viewStart;
+    const ratio = anchorRatio == null ? 0.5 : anchorRatio;
+    const anchorTime = this._viewStart + span * ratio;
+    const newSpan = this._clampSpan(span * factor);
+    this._viewStart = anchorTime - newSpan * ratio;
+    this._viewEnd = this._viewStart + newSpan;
+    this._drawTimeline();
+    this._scheduleFetch();
+  }
+
+  _resizeCanvas() {
+    const rect = this.canvasEl.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    this.canvasEl.width = Math.max(1, Math.floor(rect.width * dpr));
+    this.canvasEl.height = Math.max(1, Math.floor(46 * dpr));
+  }
+
+  // ---------- Daten laden ----------
+
+  _scheduleFetch() {
+    if (this._fetchDebounce) clearTimeout(this._fetchDebounce);
+    this._fetchDebounce = setTimeout(() => this._fetchVisiblePeriods(), 250);
+  }
+
+  _dayKey(ms) {
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  async _fetchVisiblePeriods() {
+    const camId = this.resolveCameraId();
+    if (!camId) return;
+
+    // Etwas Puffer links/rechts laden, damit Pan nicht sofort nachlädt
+    const bufferMs = (this._viewEnd - this._viewStart) * 0.5;
+    const from = this._viewStart - bufferMs;
+    const to = this._viewEnd + bufferMs;
+
+    const dayMs = 24 * 60 * 60 * 1000;
+    const days = [];
+    for (let t = Math.floor(from / dayMs) * dayMs; t < to; t += dayMs) {
+      days.push(t);
+    }
+
+    for (const dayStart of days) {
+      const key = `${camId}_${this._dayKey(dayStart)}`;
+      if (this._periodsCache.has(key) || this._pendingFetches.has(key)) continue;
+      this._pendingFetches.add(key);
+
+      const dayEnd = dayStart + dayMs;
+      this._hass.callWS({
+        type: 'call_service',
+        domain: 'wisenet_wave',
+        service: 'get_timeline',
+        service_data: { camera_id: camId, start_ms: dayStart, end_ms: dayEnd },
+        return_response: true,
+      }).then((response) => {
+        const data = response?.response || { recording: [], motion: [] };
+        this._periodsCache.set(key, data);
+        this._pendingFetches.delete(key);
+        this._drawTimeline();
+      }).catch((err) => {
+        console.warn('wisenet_wave: konnte Zeitleisten-Daten nicht laden', err);
+        this._periodsCache.set(key, { recording: [], motion: [] }); // nicht endlos neu versuchen
+        this._pendingFetches.delete(key);
+      });
+    }
+  }
+
+  // ---------- Zeichnen ----------
+
+  _drawTimeline() {
+    const ctx = this.canvasEl.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w = this.canvasEl.width;
+    const h = this.canvasEl.height;
+    const viewSpan = this._viewEnd - this._viewStart;
+
+    ctx.clearRect(0, 0, w, h);
+
+    const styles = getComputedStyle(this);
+    const bg = styles.getPropertyValue('--divider-color').trim() || '#e0e0e0';
+    const recColor = styles.getPropertyValue('--success-color').trim() || '#43a047';
+    const motColor = styles.getPropertyValue('--error-color').trim() || '#db4437';
+    const playheadColor = styles.getPropertyValue('--primary-text-color').trim() || '#000';
+
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
 
     const camId = this.resolveCameraId();
-    if (!camId) {
-      return; // Fehlermeldung wurde bereits in resolveCameraId() gesetzt
+    const dayMs = 24 * 60 * 60 * 1000;
+    const from = Math.floor(this._viewStart / dayMs) * dayMs;
+    const to = this._viewEnd + dayMs;
+
+    const drawPeriods = (periods, color) => {
+      if (!periods) return;
+      ctx.fillStyle = color;
+      for (const p of periods) {
+        const startMs = Number(p.startTimeMs ?? p.start ?? 0);
+        const durMs = Number(p.durationMs ?? p.duration ?? 0);
+        const endMs = durMs > 0 ? startMs + durMs : startMs + 60000;
+        if (endMs < this._viewStart || startMs > this._viewEnd) continue;
+        const x1 = ((Math.max(startMs, this._viewStart) - this._viewStart) / viewSpan) * w;
+        const x2 = ((Math.min(endMs, this._viewEnd) - this._viewStart) / viewSpan) * w;
+        ctx.fillRect(x1, 0, Math.max(x2 - x1, 1 * dpr), h);
+      }
+    };
+
+    for (let dayStart = from; dayStart < to; dayStart += dayMs) {
+      const key = `${camId}_${this._dayKey(dayStart)}`;
+      const data = this._periodsCache.get(key);
+      if (data) {
+        drawPeriods(data.recording, recColor);
+        drawPeriods(data.motion, motColor);
+      }
     }
 
-    // Zeitstempel in Millisekunden umwandeln
-    const timestampMs = new Date(timeValue).getTime();
+    // Playhead
+    if (this._playheadMs >= this._viewStart && this._playheadMs <= this._viewEnd) {
+      const x = ((this._playheadMs - this._viewStart) / viewSpan) * w;
+      ctx.fillStyle = playheadColor;
+      ctx.fillRect(Math.max(0, x - 1 * dpr), 0, 2 * dpr, h);
+    }
+
+    this._drawLabels(viewSpan);
+  }
+
+  _drawLabels(viewSpan) {
+    const hour = 60 * 60 * 1000;
+    const day = 24 * hour;
+    let step, formatter;
+
+    if (viewSpan <= 2 * hour) {
+      step = 10 * 60 * 1000; // 10 Min
+      formatter = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } else if (viewSpan <= 2 * day) {
+      step = hour;
+      formatter = (d) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } else if (viewSpan <= 14 * day) {
+      step = day;
+      formatter = (d) => d.toLocaleDateString([], { day: '2-digit', month: '2-digit' });
+    } else {
+      step = 7 * day;
+      formatter = (d) => d.toLocaleDateString([], { day: '2-digit', month: '2-digit' });
+    }
+
+    const first = Math.ceil(this._viewStart / step) * step;
+    const labels = [];
+    for (let t = first; t <= this._viewEnd; t += step) {
+      const ratio = (t - this._viewStart) / viewSpan;
+      labels.push({ ratio, text: formatter(new Date(t)) });
+    }
+
+    this.labelsEl.innerHTML = labels.map(
+      (l) => `<span>${l.text}</span>`
+    ).join('');
+    this.labelsEl.style.position = 'relative';
+    this.labelsEl.querySelectorAll('span').forEach((el, i) => {
+      el.style.position = 'absolute';
+      el.style.left = `${(labels[i].ratio * 100).toFixed(2)}%`;
+      el.style.transform = 'translateX(-14px)';
+    });
+  }
+
+  _updateTimeLabel() {
+    const d = new Date(this._playheadMs);
+    this.timeLabelEl.innerText = d.toLocaleString([], {
+      day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    if (this.liveBtnEl) {
+      this.liveBtnEl.classList.toggle('active', this._isLive && Math.abs(Date.now() - this._playheadMs) < 15000);
+    }
+  }
+
+  // ---------- Wiedergabe ----------
+
+  async seekTo(timestampMs) {
+    this.errorEl.innerText = '';
+    this._playheadMs = timestampMs;
+    this._isLive = Math.abs(Date.now() - timestampMs) < 15000;
+    this._updateTimeLabel();
+    this._drawTimeline();
+
+    const camId = this.resolveCameraId();
+    if (!camId) return;
 
     try {
-      // 1. Dienst im HA Backend aufrufen (unser Python Code!)
       const response = await this._hass.callWS({
         type: 'call_service',
         domain: 'wisenet_wave',
         service: 'get_archive',
-        service_data: {
-          camera_id: camId,
-          timestamp_ms: timestampMs
-        },
-        return_response: true
+        service_data: { camera_id: camId, timestamp_ms: Math.round(timestampMs) },
+        return_response: true,
       });
-
       const url = response.response.url;
-
-      // 2. Video mit HLS.js abspielen. Die URL zeigt auf den HA-eigenen Proxy,
-      //    der Browser schickt automatisch das HA-Login-Cookie mit (gleiche Origin).
+      this._streamStartMs = timestampMs;
       this.initHlsPlayer(url);
-
     } catch (err) {
       console.error(err);
-      this.errorEl.innerText = "Fehler beim Abrufen der Archiv-URL. Siehe Konsole.";
+      this.errorEl.innerText = 'Fehler beim Abrufen der Archiv-URL. Siehe Konsole.';
     }
   }
 
@@ -118,14 +521,14 @@ class WisenetWaveCard extends HTMLElement {
       this.hls.on(Hls.Events.MANIFEST_PARSED, () => {
         this.videoEl.play();
       });
-      
+
       this.hls.on(Hls.Events.ERROR, (event, data) => {
         if (data.fatal) {
           this.errorEl.innerText = "HLS Fehler: " + data.type;
         }
       });
     } else if (this.videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-      // Fallback für Apple Safari (Safari braucht oft keinen XHR Setup Trick, wenn Token als Cookie da ist, 
+      // Fallback für Apple Safari (Safari braucht oft keinen XHR Setup Trick, wenn Token als Cookie da ist,
       // aber wir probieren es trotzdem, falls Safari nativ spielt).
       this.videoEl.src = url;
       this.videoEl.play();
@@ -134,7 +537,7 @@ class WisenetWaveCard extends HTMLElement {
 
   // Diese Zeile sagt HA, wie groß die Karte im Raster ist
   getCardSize() {
-    return 4; 
+    return 4;
   }
 }
 

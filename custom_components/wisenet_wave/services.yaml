@@ -22,3 +22,35 @@ get_archive:
         number:
           min: 0
           mode: box
+
+get_timeline:
+  name: Get timeline periods
+  description: >-
+    Ruft Aufnahme- und Bewegungs-Zeiträume für eine Kamera in einem
+    Zeitfenster ab (für die Einfärbung der Zeitleiste in der Karte).
+  fields:
+    camera_id:
+      name: Camera ID
+      description: Die interne Wisenet WAVE Kamera-ID.
+      required: true
+      example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      selector:
+        text:
+    start_ms:
+      name: Start (ms)
+      description: Unix-Zeitstempel in Millisekunden, Anfang des Zeitfensters.
+      required: true
+      example: 1719840000000
+      selector:
+        number:
+          min: 0
+          mode: box
+    end_ms:
+      name: Ende (ms)
+      description: Unix-Zeitstempel in Millisekunden, Ende des Zeitfensters.
+      required: true
+      example: 1719926400000
+      selector:
+        number:
+          min: 0
+          mode: box
