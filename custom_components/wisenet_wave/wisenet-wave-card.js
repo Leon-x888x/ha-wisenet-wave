@@ -55,6 +55,16 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-content { padding: 0 16px 16px; }
             .wwc-video-wrap { position: relative; width: 100%; background: #000; border-radius: 4px; overflow: hidden; }
             .wwc-video-wrap video { width: 100%; display: block; }
+            .wwc-live-badge {
+              position: absolute; top: 8px; left: 8px; display: none; align-items: center; gap: 5px;
+              background: rgba(0,0,0,0.55); color: #fff; font-size: 11px; font-weight: 600;
+              padding: 3px 8px 3px 6px; border-radius: 10px; letter-spacing: 0.02em; pointer-events: none;
+            }
+            .wwc-live-badge-dot {
+              width: 7px; height: 7px; border-radius: 50%; background: var(--error-color, #db4437);
+              animation: wwc-pulse 1.4s ease-in-out infinite;
+            }
+            @keyframes wwc-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
             .wwc-video-wrap video.wwc-live-no-controls {
               cursor: default;
               -webkit-user-select: none;
@@ -96,12 +106,15 @@ class WisenetWaveCard extends HTMLElement {
           <div class="card-content wwc-content">
             <div class="wwc-video-wrap">
               <video id="wave-video" muted playsinline></video>
+              <div class="wwc-live-badge" id="wave-live-badge"><span class="wwc-live-badge-dot"></span>LIVE</div>
             </div>
 
             <div class="wwc-toolbar">
               <button class="wwc-btn" id="wave-skip-back" title="10s zurück"><ha-icon icon="mdi:rewind-10"></ha-icon></button>
               <button class="wwc-btn" id="wave-play-pause" title="Abspielen/Pause"><ha-icon icon="mdi:play"></ha-icon></button>
               <button class="wwc-btn" id="wave-skip-fwd" title="10s vor"><ha-icon icon="mdi:fast-forward-10"></ha-icon></button>
+              <button class="wwc-btn" id="wave-mute" title="Stumm/Ton an"><ha-icon icon="mdi:volume-off"></ha-icon></button>
+              <button class="wwc-btn" id="wave-fullscreen" title="Vollbild"><ha-icon icon="mdi:fullscreen"></ha-icon></button>
               <span class="wwc-time" id="wave-time-label">--</span>
               <div class="wwc-spacer"></div>
               <button class="wwc-live-btn" id="wave-live-btn"><span class="wwc-live-dot"></span>Live</button>
@@ -134,6 +147,7 @@ class WisenetWaveCard extends HTMLElement {
       this.timeLabelEl = this.querySelector('#wave-time-label');
       this.liveBtnEl = this.querySelector('#wave-live-btn');
       this.playPauseBtnEl = this.querySelector('#wave-play-pause');
+      this.liveBadgeEl = this.querySelector('#wave-live-badge');
 
       this._setupTransportControls();
       this._setupTimelineInteraction();
@@ -172,6 +186,21 @@ class WisenetWaveCard extends HTMLElement {
     });
     this.querySelector('#wave-zoom-in').addEventListener('click', () => this._zoomBy(0.5, null));
     this.querySelector('#wave-zoom-out').addEventListener('click', () => this._zoomBy(2, null));
+
+    const muteBtn = this.querySelector('#wave-mute');
+    muteBtn.addEventListener('click', () => {
+      this.videoEl.muted = !this.videoEl.muted;
+      muteBtn.querySelector('ha-icon').setAttribute('icon', this.videoEl.muted ? 'mdi:volume-off' : 'mdi:volume-high');
+    });
+
+    this.querySelector('#wave-fullscreen').addEventListener('click', () => {
+      const wrap = this.querySelector('.wwc-video-wrap');
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else if (wrap.requestFullscreen) {
+        wrap.requestFullscreen();
+      }
+    });
   }
 
   _setupVideoEvents() {
@@ -210,15 +239,21 @@ class WisenetWaveCard extends HTMLElement {
 
   _syncVideoUi() {
     const isLive = this._streamMode === 'live' || this._isLive;
-    this.videoEl.controls = !isLive;
+
+    // Bug-Fix: vorher wurde das controls-Attribut nach dem Setzen sofort
+    // wieder entfernt ("this.videoEl.controls = !isLive;" gefolgt von
+    // "removeAttribute('controls')"), wodurch der Player in Live- UND
+    // Archiv-Modus immer identisch aussah (native Steuerleiste je nach
+    // Browser-Timing mal da, mal weg - unabhängig vom Modus). Jetzt: nie
+    // native Controls, immer die eigene Toolbar - eindeutig und ohne
+    // Race-Conditions.
     this.videoEl.removeAttribute('controls');
+    this.videoEl.setAttribute('controlslist', 'nodownload noplaybackrate nofullscreen');
     this.videoEl.classList.toggle('wwc-live-no-controls', isLive);
-    if (isLive) {
-      this.videoEl.setAttribute('controlslist', 'nodownload noplaybackrate');
-      this.videoEl.style.setProperty('pointer-events', 'none');
-    } else {
-      this.videoEl.removeAttribute('controlslist');
-      this.videoEl.style.removeProperty('pointer-events');
+    this.videoEl.style.setProperty('pointer-events', 'none');
+
+    if (this.liveBadgeEl) {
+      this.liveBadgeEl.style.display = isLive ? 'flex' : 'none';
     }
 
     const skipBackBtn = this.querySelector('#wave-skip-back');
