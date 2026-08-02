@@ -1,4 +1,5 @@
 """The Wisenet WAVE integration."""
+import asyncio
 import os
 from datetime import timedelta
 from homeassistant.components.http import StaticPathConfig
@@ -72,47 +73,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ---------------------------------------------------------
 
     # --- NEU: Service für die Zeitleisten-Einfärbung (Aufnahme/Bewegung) ---
-    def _periods_identical(a: list, b: list) -> bool:
-        """Prüft, ob zwei Perioden-Listen inhaltlich exakt gleich sind."""
-        if not a or not b or len(a) != len(b):
-            return False
-        for pa, pb in zip(a, b):
-            if str(pa.get("startTimeMs")) != str(pb.get("startTimeMs")):
-                return False
-            if str(pa.get("durationMs")) != str(pb.get("durationMs")):
-                return False
-        return True
-
     async def handle_get_timeline(call: ServiceCall):
         """Handler für den wisenet_wave.get_timeline Service."""
         camera_id = call.data.get("camera_id")
         start_ms = call.data.get("start_ms")
         end_ms = call.data.get("end_ms")
 
-        recording, rec_err = await client.async_get_recorded_periods(
+        # Aufnahme- und Bewegungsdaten parallel laden, damit die Leiste nicht
+        # auf zwei langsame WAVE-Requests wartet.
+        recording_task = client.async_get_recorded_periods(
             camera_id, start_ms, end_ms, "recording"
         )
-        motion, mot_err = await client.async_get_recorded_periods(
+        motion_task = client.async_get_recorded_periods(
             camera_id, start_ms, end_ms, "motion"
         )
+        recording_result, motion_result = await asyncio.gather(
+            recording_task, motion_task
+        )
 
-        # Manche WAVE-Server liefern bei periodsType=motion keine echte
-        # Filterung (identisch zu recording). Dann automatisch den
-        # alternativen, ebenfalls von Nx/WAVE dokumentierten Wert
-        # "analytics" probieren - falls DER sich wirklich unterscheidet,
-        # nehmen wir den stattdessen.
-        if not mot_err and _periods_identical(recording, motion):
-            alt_motion, alt_err = await client.async_get_recorded_periods(
-                camera_id, start_ms, end_ms, "analytics"
-            )
-            if not alt_err and not _periods_identical(recording, alt_motion):
-                motion, mot_err = alt_motion, None
-            else:
-                mot_err = (
-                    "Server liefert für periodsType=motion und =analytics beides Mal "
-                    "identische Daten wie recording - keine getrennte Bewegungserkennung "
-                    "über diese API verfügbar."
-                )
+        recording, rec_err = recording_result
+        motion, mot_err = motion_result
 
         error = rec_err or mot_err
 
