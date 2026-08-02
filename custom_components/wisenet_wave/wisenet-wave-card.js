@@ -55,7 +55,17 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-content { padding: 0 16px 16px; }
             .wwc-video-wrap { position: relative; width: 100%; background: #000; border-radius: 4px; overflow: hidden; }
             .wwc-video-wrap video { width: 100%; display: block; }
-            .wwc-video-wrap video.wwc-live-no-controls { cursor: default; }
+            .wwc-video-wrap video.wwc-live-no-controls {
+              cursor: default;
+              -webkit-user-select: none;
+              user-select: none;
+            }
+            .wwc-video-wrap video.wwc-live-no-controls::-webkit-media-controls {
+              display: none !important;
+            }
+            .wwc-video-wrap video.wwc-live-no-controls::cue {
+              display: none;
+            }
             .wwc-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
             .wwc-btn {
               display: flex; align-items: center; justify-content: center;
@@ -85,7 +95,7 @@ class WisenetWaveCard extends HTMLElement {
           </style>
           <div class="card-content wwc-content">
             <div class="wwc-video-wrap">
-              <video id="wave-video" controls muted playsinline></video>
+              <video id="wave-video" muted playsinline></video>
             </div>
 
             <div class="wwc-toolbar">
@@ -201,7 +211,15 @@ class WisenetWaveCard extends HTMLElement {
   _syncVideoUi() {
     const isLive = this._streamMode === 'live' || this._isLive;
     this.videoEl.controls = !isLive;
+    this.videoEl.removeAttribute('controls');
     this.videoEl.classList.toggle('wwc-live-no-controls', isLive);
+    if (isLive) {
+      this.videoEl.setAttribute('controlslist', 'nodownload noplaybackrate');
+      this.videoEl.style.setProperty('pointer-events', 'none');
+    } else {
+      this.videoEl.removeAttribute('controlslist');
+      this.videoEl.style.removeProperty('pointer-events');
+    }
 
     const skipBackBtn = this.querySelector('#wave-skip-back');
     const skipFwdBtn = this.querySelector('#wave-skip-fwd');
