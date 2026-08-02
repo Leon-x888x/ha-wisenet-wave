@@ -56,10 +56,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Signierte URL statt Auth-Header: das ist der HA-Standardweg für sowas
         # (genau wie bei den eingebauten Kamera-/Snapshot-URLs).
         stream_mode = call.data.get("stream_mode", "archive")
+        # Wisenet/WAVE supports separate HLS substreams. We request the
+        # explicit high-resolution variant here instead of relying on the
+        # server's automatic ABR/master-playlist selection.
         if stream_mode == "live":
-            proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8"
+            proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?hi"
         else:
-            proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
+            proxy_url = f"/api/wisenet_wave/proxy/{entry.entry_id}/hls/{camera_id}.m3u8?hi&pos={timestamp_ms}"
         signed_url = async_sign_path(hass, proxy_url, timedelta(hours=2))
 
         return {

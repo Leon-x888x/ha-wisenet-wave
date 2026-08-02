@@ -170,6 +170,7 @@ class WisenetWaveApiClient:
         import urllib.parse
         safe_password = urllib.parse.quote(self.password)
         
-        # Wisenet WAVE HLS Endpunkt für Archive. 
-        # pos = Startzeitpunkt (Epoch in ms). 
-        return f"https://{self.username}:{safe_password}@{self.host}:{self.port}/hls/{camera_id}.m3u8?pos={timestamp_ms}"
+        # Wisenet WAVE HLS Endpunkt für Archive.
+        # Explicitly request the high-resolution variant instead of relying
+        # on the server's automatic substream selection.
+        return f"https://{self.username}:{safe_password}@{self.host}:{self.port}/hls/{camera_id}.m3u8?hi&pos={timestamp_ms}"
