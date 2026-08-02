@@ -517,7 +517,10 @@ class WisenetWaveCard extends HTMLElement {
       for (const p of periods) {
         const startMs = Number(p.startTimeMs ?? p.start ?? 0);
         const durMs = Number(p.durationMs ?? p.duration ?? 0);
-        const endMs = durMs > 0 ? startMs + durMs : startMs + 60000;
+        // WAVE liefert durationMs = -1 für Perioden, die noch laufen (z.B.
+        // die aktuell aufgezeichnete Chunk). Die zeichnen wir bis "jetzt",
+        // statt sie fälschlich auf 1 Minute zu verkürzen.
+        const endMs = durMs < 0 ? Date.now() : (durMs > 0 ? startMs + durMs : startMs + 60000);
         if (endMs < this._viewStart || startMs > this._viewEnd) continue;
         const x1 = ((Math.max(startMs, this._viewStart) - this._viewStart) / viewSpan) * w;
         const x2 = ((Math.min(endMs, this._viewEnd) - this._viewStart) / viewSpan) * w;

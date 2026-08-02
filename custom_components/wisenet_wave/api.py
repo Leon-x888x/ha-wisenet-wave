@@ -134,9 +134,27 @@ class WisenetWaveApiClient:
                         )
                         return [], f"HTTP {response.status} von {url}"
                     data = await response.json()
-                    # "flat=true" liefert direkt eine Liste von {startTimeMs, durationMs}
+                    # WAVE liefert trotz "flat=true" i.d.R. KEIN reines Array,
+                    # sondern {"error": "0", "errorId": "ok", "reply": [...]}.
+                    # Die eigentlichen Perioden stecken in "reply".
+                    periods = None
                     if isinstance(data, list):
-                        return data, None
+                        periods = data
+                    elif isinstance(data, dict):
+                        reply = data.get("reply")
+                        if isinstance(reply, list):
+                            periods = reply
+                        elif str(data.get("error", "0")) not in ("0", ""):
+                            _LOGGER.warning(
+                                "wisenet_wave: recordedTimePeriods (%s) für %s meldete "
+                                "Server-Fehler: %s",
+                                periods_type, camera_id, data.get("errorString") or data.get("errorId"),
+                            )
+                            return [], f"WAVE-Fehler: {data.get('errorString') or data.get('errorId')}"
+
+                    if periods is not None:
+                        return periods, None
+
                     _LOGGER.warning(
                         "wisenet_wave: recordedTimePeriods (%s) für %s lieferte unerwartetes "
                         "Format (kein JSON-Array): %s",
