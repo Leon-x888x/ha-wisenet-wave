@@ -60,11 +60,30 @@ class WisenetWaveProxyView(HomeAssistantView):
         # Token-Refresh, wie bisher), und falls das WEITERHIN mit
         # 401/403/404/502 fehlschlägt, einmal zusätzlich mit Basic-Auth
         # probieren, bevor wir endgültig aufgeben.
-        auth_attempts = [
-            {"force_refresh": False, "basic": False},
-            {"force_refresh": True, "basic": False},
-            {"force_refresh": False, "basic": True},
-        ]
+        # Bug-Fix: Reihenfolge/Anzahl der Versuche hängt jetzt davon ab, ob
+        # wir für DIESEN Client (= diesen WAVE-Server) bereits wissen, dass
+        # Basic-Auth nötig ist. Ohne das musste bisher buchstäblich JEDE
+        # Playlist- und Segment-Anfrage eines Live-Streams (alle paar
+        # Sekunden, pro Kamera!) erst zwei erfolglose Bearer-Versuche
+        # (inkl. eines echten Login-Requests beim force_refresh) durchlaufen,
+        # bevor die eigentlich funktionierende Basic-Auth probiert wurde.
+        # Diese wiederholte, unnötige Latenz pro Request ist der
+        # wahrscheinlichste Grund für die immer wiederkehrenden HLS-Aussetzer
+        # ("stoppt einfach", "geht aus Live raus") - hls.js' eigene
+        # Netzwerk-Timeouts greifen dann, obwohl der Stream an sich in
+        # Ordnung wäre, es hat nur zu lange gedauert.
+        if client.hls_prefers_basic_auth:
+            auth_attempts = [
+                {"force_refresh": False, "basic": True},
+                {"force_refresh": False, "basic": False},
+                {"force_refresh": True, "basic": False},
+            ]
+        else:
+            auth_attempts = [
+                {"force_refresh": False, "basic": False},
+                {"force_refresh": True, "basic": False},
+                {"force_refresh": False, "basic": True},
+            ]
 
         last_resp_status = None
         last_resp_body = None
@@ -96,11 +115,16 @@ class WisenetWaveProxyView(HomeAssistantView):
                     if path.endswith(".m3u8"):
                         body = self._rewrite_playlist(body, entry_id)
 
-                    if attempt_info["basic"]:
+                    if attempt_info["basic"] and not client.hls_prefers_basic_auth:
                         _LOGGER.info(
                             "wisenet_wave: /hls/-Endpunkt hat mit Basic-Auth funktioniert, "
-                            "nicht mit Bearer-Token (%s)", target_url,
+                            "nicht mit Bearer-Token (%s). Folgeanfragen versuchen ab jetzt "
+                            "direkt Basic-Auth zuerst.", target_url,
                         )
+                    # Erfolgreiche Methode merken, damit künftige Requests
+                    # (nächstes Segment, nächste Playlist-Aktualisierung ...)
+                    # nicht wieder unnötig mit der falschen Methode starten.
+                    client.hls_prefers_basic_auth = attempt_info["basic"]
 
                     return web.Response(body=body, status=resp.status, content_type=content_type)
             except Exception as err:  # noqa: BLE001

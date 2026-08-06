@@ -15,6 +15,14 @@ class WisenetWaveApiClient:
         self.base_url = f"https://{host}:{port}"
         self._token = None
         self._token_expires_at = 0
+        # Manche WAVE-Server-Versionen akzeptieren am /hls/-Endpunkt keinen
+        # Bearer-Token (nur klassische Basic-Auth). Sobald der Proxy das
+        # einmal herausgefunden hat, merken wir es uns hier, damit nicht
+        # JEDE einzelne Playlist-/Segment-Anfrage (bei Live-Streams alle
+        # paar Sekunden!) erst zwei fehlschlagende Bearer-Versuche
+        # durchlaufen muss, bevor Basic-Auth versucht wird. Das war die
+        # Hauptursache für die spürbaren Latenzen/Aussetzer im Player.
+        self.hls_prefers_basic_auth = False
 
     async def async_login(self) -> bool:
         """Authenticate with Wisenet WAVE 6.x and retrieve a Bearer token."""
