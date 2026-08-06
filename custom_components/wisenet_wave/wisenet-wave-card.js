@@ -82,22 +82,24 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-video-wrap video.wwc-live-no-controls::cue {
               display: none;
             }
-            .wwc-toolbar { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+            .wwc-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
             .wwc-btn {
               display: flex; align-items: center; justify-content: center;
               width: 32px; height: 32px; padding: 0; border-radius: 50%;
               border: none; background: transparent; color: var(--primary-text-color);
               cursor: pointer;
+              flex: 0 0 auto;
             }
             .wwc-btn:hover { background: var(--divider-color, rgba(0,0,0,0.08)); }
             .wwc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
             .wwc-btn ha-icon { --mdc-icon-size: 20px; }
-            .wwc-time { font-family: var(--code-font-family, monospace); font-size: 13px; color: var(--secondary-text-color); min-width: 148px; }
-            .wwc-spacer { flex: 1; }
+            .wwc-time { font-family: var(--code-font-family, monospace); font-size: 13px; color: var(--secondary-text-color); min-width: 120px; white-space: nowrap; }
+            .wwc-spacer { flex: 1 1 0; min-width: 0; }
             .wwc-live-btn {
               font-size: 12px; font-weight: 500; padding: 4px 10px; border-radius: 12px;
               border: 1px solid var(--divider-color); background: none; cursor: pointer;
               color: var(--secondary-text-color); display: flex; align-items: center; gap: 4px;
+              flex: 0 0 auto;
             }
             .wwc-live-btn.active { color: var(--error-color, #db4437); border-color: var(--error-color, #db4437); }
             .wwc-live-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
@@ -347,6 +349,12 @@ class WisenetWaveCard extends HTMLElement {
     if (this._rafId) return;
     const tick = () => {
       if (this._streamStartMs != null && !this.videoEl.paused) {
+        if (this._isLive) {
+          const span = this._viewEnd - this._viewStart;
+          const now = Date.now();
+          this._viewEnd = now;
+          this._viewStart = now - span;
+        }
         this._playheadMs = this._streamStartMs + this.videoEl.currentTime * 1000;
         this._updateTimeLabel();
         this._drawTimeline();
@@ -813,7 +821,8 @@ class WisenetWaveCard extends HTMLElement {
       }
 
       this.hls = new Hls({
-        liveSyncDurationCount: 3,
+        liveSyncDurationCount: 1,
+        liveMaxLatencyDurationCount: 3,
         maxBufferLength: 20,
         maxBufferHole: 1.5,
         liveDurationInfinity: options.mode === 'live',
