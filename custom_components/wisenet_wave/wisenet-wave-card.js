@@ -2,11 +2,12 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-11-26 geladen');
+console.info('[wisenet-wave-card] Version 2026-11-26-videozoom geladen');
 
 const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const TIMELINE_RETRY_MS = 15000;
 const TIMELINE_REQUEST_LIMIT = 4;
+const VIDEO_ZOOM_LEVELS = [1, 1.5, 2, 3, 4];
 let hlsLibraryPromise;
 
 function loadHlsLibrary() {
@@ -66,6 +67,9 @@ class WisenetWaveCard extends HTMLElement {
     this._streamMode = 'live';
     this._waitingForCamera = false;
     this._resumePaused = false;
+    this._videoZoomIndex = 0;
+    this._videoOffsetX = 0;
+    this._videoOffsetY = 0;
     if (this.isConnected && this._hass) this.hass = this._hass;
   }
 
@@ -116,6 +120,17 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-content { padding: 0 16px 16px; }
             .wwc-video-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 4px; overflow: hidden; }
             .wwc-video-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+            .wwc-video-wrap.wwc-video-pannable { cursor: grab; touch-action: none; user-select: none; }
+            .wwc-video-wrap.wwc-video-dragging { cursor: grabbing; }
+            .wwc-video-zoom {
+              position: absolute; right: 8px; bottom: 8px; display: flex; align-items: center;
+              border-radius: 8px; background: rgba(0,0,0,0.75); color: #fff;
+              touch-action: manipulation;
+            }
+            .wwc-video-zoom button { color: inherit; border-radius: 8px; width: 40px; height: 40px; }
+            .wwc-video-zoom button:hover:not(:disabled) { background: rgba(255,255,255,0.2); }
+            .wwc-video-zoom button:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+            .wwc-video-zoom-reset { min-width: 44px; font-size: 12px; font-variant-numeric: tabular-nums; }
             .wwc-live-badge {
               position: absolute; top: 8px; left: 8px; display: none; align-items: center; gap: 5px;
               background: rgba(0,0,0,0.55); color: #fff; font-size: 11px; font-weight: 600;
@@ -170,6 +185,11 @@ class WisenetWaveCard extends HTMLElement {
             <div class="wwc-video-wrap">
               <video id="wave-video" muted playsinline></video>
               <div class="wwc-live-badge" id="wave-live-badge"><span class="wwc-live-badge-dot"></span>LIVE</div>
+              <div class="wwc-video-zoom" role="group" aria-label="Videozoom">
+                <button type="button" class="wwc-btn" id="wave-video-zoom-out" title="Video verkleinern" aria-label="Video verkleinern"><ha-icon icon="mdi:minus"></ha-icon></button>
+                <button type="button" class="wwc-btn wwc-video-zoom-reset" id="wave-video-zoom-reset" title="Videozoom zurücksetzen">1×</button>
+                <button type="button" class="wwc-btn" id="wave-video-zoom-in" title="Video vergrößern" aria-label="Video vergrößern"><ha-icon icon="mdi:plus"></ha-icon></button>
+              </div>
             </div>
 
             <div class="wwc-toolbar">
@@ -206,6 +226,7 @@ class WisenetWaveCard extends HTMLElement {
       this.querySelector('ha-card').setAttribute('header', this.config.title || 'Wisenet WAVE Archiv');
       this.content = this.querySelector('.card-content');
       this.videoEl = this.querySelector('#wave-video');
+      this.videoWrapEl = this.querySelector('.wwc-video-wrap');
       this.errorEl = this.querySelector('#wave-error');
       this.timelineErrorEl = this.querySelector('#wave-timeline-error');
       this.canvasEl = this.querySelector('#wave-canvas');
@@ -216,6 +237,7 @@ class WisenetWaveCard extends HTMLElement {
       this.liveBadgeEl = this.querySelector('#wave-live-badge');
 
       this._setupTransportControls();
+      this._setupVideoZoom();
       this._setupTimelineInteraction();
       this._setupVideoEvents();
       this._syncVideoUi();
@@ -252,8 +274,10 @@ class WisenetWaveCard extends HTMLElement {
         this._canvasResizeObserver = new ResizeObserver(() => {
           this._resizeCanvas();
           this._drawTimeline();
+          this._renderVideoZoom();
         });
         this._canvasResizeObserver.observe(this.querySelector('.wwc-timeline-wrap'));
+        this._canvasResizeObserver.observe(this.videoWrapEl);
       } else {
         // Fallback für sehr alte Browser ohne ResizeObserver: nach dem
         // ersten Layout-Durchlauf (nächster Frame) nochmal neu messen.
@@ -319,13 +343,87 @@ class WisenetWaveCard extends HTMLElement {
     });
 
     this.querySelector('#wave-fullscreen').addEventListener('click', () => {
-      const wrap = this.querySelector('.wwc-video-wrap');
       if (document.fullscreenElement) {
         document.exitFullscreen();
-      } else if (wrap.requestFullscreen) {
-        wrap.requestFullscreen();
+      } else if (this.videoWrapEl.requestFullscreen) {
+        this.videoWrapEl.requestFullscreen();
       }
     });
+  }
+
+  _setupVideoZoom() {
+    const wrap = this.videoWrapEl;
+    const { signal } = this._listeners;
+    const zoomIn = this.querySelector('#wave-video-zoom-in');
+    const zoomOut = this.querySelector('#wave-video-zoom-out');
+    const reset = this.querySelector('#wave-video-zoom-reset');
+    this._videoZoomControls = { zoomIn, zoomOut, reset };
+    zoomIn.addEventListener('click', () => this._setVideoZoom(this._videoZoomIndex + 1), { signal });
+    zoomOut.addEventListener('click', () => this._setVideoZoom(this._videoZoomIndex - 1), { signal });
+    reset.addEventListener('click', () => this._setVideoZoom(0), { signal });
+    this.videoEl.addEventListener('resize', () => this._renderVideoZoom(), { signal });
+
+    let drag = null;
+    wrap.addEventListener('pointerdown', (event) => {
+      if (!this._videoZoomIndex || drag || event.button !== 0 || event.target.closest('.wwc-video-zoom')) return;
+      const { width, height } = this._videoImageSize();
+      if (!width || !height) return;
+      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, width, height };
+      wrap.setPointerCapture(event.pointerId);
+      wrap.classList.add('wwc-video-dragging');
+    }, { signal });
+    wrap.addEventListener('pointermove', (event) => {
+      if (drag?.id !== event.pointerId) return;
+      this._videoOffsetX += (event.clientX - drag.x) / drag.width;
+      this._videoOffsetY += (event.clientY - drag.y) / drag.height;
+      drag.x = event.clientX;
+      drag.y = event.clientY;
+      this._renderVideoZoom();
+    }, { signal });
+    wrap.addEventListener('lostpointercapture', (event) => {
+      if (drag?.id !== event.pointerId) return;
+      drag = null;
+      wrap.classList.remove('wwc-video-dragging');
+    }, { signal });
+    this._renderVideoZoom();
+  }
+
+  _setVideoZoom(index) {
+    const previous = VIDEO_ZOOM_LEVELS[this._videoZoomIndex];
+    this._videoZoomIndex = Math.max(0, Math.min(VIDEO_ZOOM_LEVELS.length - 1, index));
+    const ratio = VIDEO_ZOOM_LEVELS[this._videoZoomIndex] / previous;
+    this._videoOffsetX *= ratio;
+    this._videoOffsetY *= ratio;
+    this._renderVideoZoom();
+  }
+
+  _videoImageSize() {
+    const { clientWidth, clientHeight } = this.videoWrapEl;
+    const { videoWidth, videoHeight } = this.videoEl;
+    if (!videoWidth || !videoHeight) return { width: clientWidth, height: clientHeight };
+    const fit = Math.min(clientWidth / videoWidth, clientHeight / videoHeight);
+    return { width: videoWidth * fit, height: videoHeight * fit };
+  }
+
+  _renderVideoZoom() {
+    const zoom = VIDEO_ZOOM_LEVELS[this._videoZoomIndex];
+    const wrap = this.videoWrapEl;
+    const { zoomIn, zoomOut, reset } = this._videoZoomControls;
+    const label = `${zoom.toLocaleString('de-DE')}×`;
+    zoomIn.disabled = this._videoZoomIndex === VIDEO_ZOOM_LEVELS.length - 1;
+    zoomOut.disabled = reset.disabled = this._videoZoomIndex === 0;
+    reset.textContent = label;
+    reset.setAttribute('aria-label', `Videozoom ${label}, zurücksetzen`);
+    wrap.classList.toggle('wwc-video-pannable', zoom > 1);
+
+    const { width, height } = this._videoImageSize();
+    if (!width || !height) return;
+    const limitX = Math.max(0, (zoom - wrap.clientWidth / width) / 2);
+    const limitY = Math.max(0, (zoom - wrap.clientHeight / height) / 2);
+    this._videoOffsetX = Math.max(-limitX, Math.min(limitX, this._videoOffsetX));
+    this._videoOffsetY = Math.max(-limitY, Math.min(limitY, this._videoOffsetY));
+    this.videoEl.style.transform = zoom === 1 ? '' :
+      `translate(${this._videoOffsetX * width}px, ${this._videoOffsetY * height}px) scale(${zoom})`;
   }
 
   _setupVideoEvents() {
@@ -613,6 +711,7 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _refreshVideoLayout() {
+    this._renderVideoZoom();
     if (!this.videoEl || !this._currentStreamUrl) return;
     // Bug-Fix: Dieser Reflow-Trick wurde bisher nur im Live-Modus
     // ausgeführt ("if (!isLive) return;"). Genau dasselbe Rendering-Problem
