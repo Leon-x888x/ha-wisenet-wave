@@ -2,7 +2,39 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-08-02-hi geladen');
+console.info('[wisenet-wave-card] Version 2026-11-26 geladen');
+
+const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
+const TIMELINE_RETRY_MS = 15000;
+const TIMELINE_REQUEST_LIMIT = 4;
+let hlsLibraryPromise;
+
+function loadHlsLibrary() {
+  if (window.Hls) return Promise.resolve(window.Hls);
+  if (!hlsLibraryPromise) {
+    hlsLibraryPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      const failed = () => {
+        clearTimeout(timeout);
+        script.remove();
+        reject(new Error('HLS.js konnte nicht geladen werden'));
+      };
+      const timeout = setTimeout(failed, 8000);
+      script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.7.4';
+      script.onload = () => {
+        clearTimeout(timeout);
+        if (window.Hls) resolve(window.Hls);
+        else failed();
+      };
+      script.onerror = failed;
+      document.head.appendChild(script);
+    }).catch((error) => {
+      hlsLibraryPromise = null;
+      throw error;
+    });
+  }
+  return hlsLibraryPromise;
+}
 
 class WisenetWaveCard extends HTMLElement {
   // Wird aufgerufen, wenn die Karte in HA konfiguriert wird
@@ -10,13 +42,14 @@ class WisenetWaveCard extends HTMLElement {
     if (!config.entity && !config.camera_id) {
       throw new Error('Du musst entweder "entity" (z.B. camera.terrasse) oder "camera_id" angeben!');
     }
+    if (this._listeners) this.disconnectedCallback();
     this.config = config;
 
     // Zeitleisten-Zustand
     this._viewEnd = Date.now();
     this._viewStart = this._viewEnd - 60 * 60 * 1000; // Start: letzte Stunde
     this._playheadMs = this._viewEnd;
-    this._isLive = false;
+    this._isLive = true;
     this._periodsCache = new Map(); // Tagesschlüssel -> {recording:[], motion:[]}
     this._pendingFetches = new Set();
     this._dragState = null;
@@ -24,12 +57,16 @@ class WisenetWaveCard extends HTMLElement {
     this._fetchDebounce = null;
     this._rafId = null;
     this._loadWatchdogId = null;
-    this._timelineErrorShown = false;
+    this._timelineRetryTimer = null;
+    this._timelineRetryAt = 0;
     this._hlsRetryTimer = null;
     this._hlsRetryCount = 0;
-    this._activeStreamToken = 0;
+    this._activeStreamToken = (this._activeStreamToken ?? 0) + 1;
     this._currentStreamUrl = null;
-    this._streamMode = 'archive';
+    this._streamMode = 'live';
+    this._waitingForCamera = false;
+    this._resumePaused = false;
+    if (this.isConnected && this._hass) this.hass = this._hass;
   }
 
   // Ermittelt die interne Wisenet-Kamera-ID: entweder direkt aus camera_id,
@@ -51,12 +88,30 @@ class WisenetWaveCard extends HTMLElement {
     return camId;
   }
 
+  _cameraServiceData() {
+    const entity = this._hass?.states?.[this.config.entity];
+    const cameraId = this.resolveCameraId();
+    if (!cameraId) return null;
+
+    const entryId = this.config.config_entry_id || entity?.attributes.wisenet_entry_id;
+    return entryId
+      ? { camera_id: cameraId, config_entry_id: entryId }
+      : { camera_id: cameraId };
+  }
+
+  connectedCallback() {
+    if (this._hass) this.hass = this._hass;
+  }
+
   // Home Assistant Objekt (wird bei jeder Änderung von HA aktualisiert)
   set hass(hass) {
     this._hass = hass;
+    if (!this.isConnected || !this.config || !hass) return;
     if (!this.content) {
+      this._listeners = new AbortController();
+      const { signal } = this._listeners;
       this.innerHTML = `
-        <ha-card header="${this.config.title || 'Wisenet WAVE Archiv'}">
+        <ha-card>
           <style>
             .wwc-content { padding: 0 16px 16px; }
             .wwc-video-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 4px; overflow: hidden; }
@@ -143,13 +198,16 @@ class WisenetWaveCard extends HTMLElement {
               </div>
             </div>
 
+            <div id="wave-timeline-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
             <div id="wave-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
           </div>
         </ha-card>
       `;
+      this.querySelector('ha-card').setAttribute('header', this.config.title || 'Wisenet WAVE Archiv');
       this.content = this.querySelector('.card-content');
       this.videoEl = this.querySelector('#wave-video');
       this.errorEl = this.querySelector('#wave-error');
+      this.timelineErrorEl = this.querySelector('#wave-timeline-error');
       this.canvasEl = this.querySelector('#wave-canvas');
       this.labelsEl = this.querySelector('#wave-timeline-labels');
       this.timeLabelEl = this.querySelector('#wave-time-label');
@@ -172,12 +230,12 @@ class WisenetWaveCard extends HTMLElement {
         this._resizeCanvas();
         this._drawTimeline();
         this._refreshVideoLayout();
-      });
+      }, { signal });
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
           this._refreshVideoLayout();
         }
-      });
+      }, { signal });
 
       // Bug-Fix: Beim ersten Rendern der Karte hat das HA-Dashboard-Grid
       // (Masonry-Layout) die tatsächliche Breite der Karte oft noch nicht
@@ -200,19 +258,40 @@ class WisenetWaveCard extends HTMLElement {
         // Fallback für sehr alte Browser ohne ResizeObserver: nach dem
         // ersten Layout-Durchlauf (nächster Frame) nochmal neu messen.
         requestAnimationFrame(() => {
+          if (signal.aborted) return;
           this._resizeCanvas();
           this._drawTimeline();
         });
       }
 
-      // Standardmäßig direkt live starten, statt mit leerem Player zu warten
-      this.seekTo(Date.now(), { isLive: true });
+      this.seekTo(this._isLive ? Date.now() : this._playheadMs, {
+        isLive: this._isLive,
+        autoplay: !this._resumePaused,
+      });
+    } else if (this._waitingForCamera && this._cameraServiceData()) {
+      this._scheduleFetch();
+      this.seekTo(this._isLive ? Date.now() : this._playheadMs, {
+        isLive: this._isLive,
+        autoplay: !this._resumePaused,
+      });
     }
   }
 
   _setupTransportControls() {
     this.querySelector('#wave-play-pause').addEventListener('click', () => {
-      if (this.videoEl.paused) { this.videoEl.play(); } else { this.videoEl.pause(); }
+      if (this.videoEl.paused) {
+        this._resumePaused = false;
+        if (this._currentStreamUrl && !this.videoEl.error && this._hlsRetryTimer === null) {
+          this.videoEl.play().catch(() => {});
+        } else {
+          this.seekTo(this._playheadMs, { isLive: false });
+        }
+      } else {
+        this._resumePaused = true;
+        this._clearLoadWatchdog();
+        this._clearHlsRetry();
+        this.videoEl.pause();
+      }
     });
     this.querySelector('#wave-skip-back').addEventListener('click', () => {
       this.seekTo(this._playheadMs - 10000);
@@ -250,23 +329,47 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _setupVideoEvents() {
+    const { signal } = this._listeners;
     this.videoEl.addEventListener('play', () => {
       this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:pause');
       this._startPlayheadLoop();
-    });
+      if (this._currentStreamUrl && this.videoEl.readyState < 3) this._startLoadWatchdog();
+    }, { signal });
     this.videoEl.addEventListener('pause', () => {
       this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:play');
       this._stopPlayheadLoop();
-    });
+    }, { signal });
     this.videoEl.addEventListener('playing', () => {
+      this._lastProgressTime = this.videoEl.currentTime;
+    }, { signal });
+    this.videoEl.addEventListener('timeupdate', () => {
+      const video = this.videoEl;
+      if (!this._currentStreamUrl || video.paused || video.seeking || video.readyState < 2) return;
+      if (video.currentTime <= this._lastProgressTime) return;
+      this._lastProgressTime = video.currentTime;
       this._clearLoadWatchdog();
-      // Wenn die Wiedergabe wirklich wieder läuft, war der vorherige
-      // "fatale" HLS-Fehler offenbar doch selbst-heilend (hls.js/Browser
-      // haben sich erholt) - alte Fehlermeldung dann nicht stehen lassen.
+      if (this._hlsRetryTimer !== null && !this._cancelRetryOnProgress) return;
+      this._clearHlsRetry();
+      if (video.currentTime >= this._stablePlaybackStart + 10) {
+        this._hlsRetryCount = 0;
+        this._stablePlaybackStart = video.currentTime;
+      }
       if (this.errorEl.innerText.startsWith('HLS Fehler') || this.errorEl.innerText.startsWith('Stream vorübergehend')) {
         this.errorEl.innerText = '';
       }
-    });
+    }, { signal });
+    for (const event of ['waiting', 'stalled']) {
+      this.videoEl.addEventListener(event, () => {
+        if (this._currentStreamUrl && !this.videoEl.paused && !this.videoEl.seeking) {
+          this._startLoadWatchdog();
+        }
+      }, { signal });
+    }
+    this.videoEl.addEventListener('error', () => {
+      if (!this.hls && this._currentStreamUrl && this.videoEl.error) {
+        this._queueStreamRetry('Videofehler', this._activeStreamToken);
+      }
+    }, { signal });
     // Bug-Fix: Nach jedem Stream-Wechsel (Seek, Skip vor/zurück, Reload,
     // Live<->Archiv) lädt der Browser neue Video-Dimensionen ins gleiche
     // <video>-Element. "object-fit: contain" wird dabei nicht immer sofort
@@ -293,29 +396,22 @@ class WisenetWaveCard extends HTMLElement {
         (level ? ` (${level.width}x${level.height}, bitrate=${level.bitrate})` : ''),
       );
       this._refreshVideoLayout();
-    });
+    }, { signal });
   }
 
-  // Verhindert einen dauerhaften Ladescreen, wenn für den angefragten
-  // Zeitpunkt gar kein Videomaterial existiert (z.B. Live-Sprung auf eine
-  // Kamera, die gerade nichts aufzeichnet). hls.js feuert in solchen Fällen
-  // oft weder MANIFEST_PARSED noch einen fatalen Error - der Player bleibt
-  // einfach ewig im Ladezustand hängen.
   _startLoadWatchdog() {
-    this._clearLoadWatchdog();
+    if (this._loadWatchdogId !== null || this._resumePaused) return;
+    const token = this._activeStreamToken;
     this._loadWatchdogId = setTimeout(() => {
-      if (this.videoEl.readyState < 2) {
-        this.errorEl.innerText = 'Für diesen Zeitpunkt ist kein Video verfügbar.';
-        if (this.hls) { this.hls.destroy(); this.hls = null; }
-      }
+      this._loadWatchdogId = null;
+      if (this.videoEl.ended || (this.videoEl.paused && this.videoEl.readyState >= 2)) return;
+      this._queueStreamRetry('Wiedergabe steht still', token, true);
     }, 9000);
   }
 
   _clearLoadWatchdog() {
-    if (this._loadWatchdogId) {
-      clearTimeout(this._loadWatchdogId);
-      this._loadWatchdogId = null;
-    }
+    clearTimeout(this._loadWatchdogId);
+    this._loadWatchdogId = null;
   }
 
   _syncVideoUi() {
@@ -375,6 +471,7 @@ class WisenetWaveCard extends HTMLElement {
 
   _setupTimelineInteraction() {
     const canvas = this.canvasEl;
+    const { signal } = this._listeners;
 
     canvas.addEventListener('wheel', (ev) => {
       ev.preventDefault();
@@ -398,7 +495,7 @@ class WisenetWaveCard extends HTMLElement {
       this._viewEnd = this._dragState.origEnd - deltaMs;
       this._clampView();
       this._drawTimeline();
-    });
+    }, { signal });
     window.addEventListener('mouseup', (ev) => {
       if (!this._dragState) return;
       const wasDrag = this._dragState.moved;
@@ -412,7 +509,7 @@ class WisenetWaveCard extends HTMLElement {
           this.seekTo(t);
         }
       }
-    });
+    }, { signal });
 
     // Touch: 1 Finger = Pan/Klick, 2 Finger = Pinch-Zoom
     canvas.addEventListener('touchstart', (ev) => {
@@ -529,71 +626,98 @@ class WisenetWaveCard extends HTMLElement {
     this.videoEl.style.visibility = 'hidden';
     this.videoEl.offsetHeight;
     this.videoEl.style.visibility = 'visible';
-    if (this.videoEl.readyState >= 2 && this.videoEl.paused) {
-      this.videoEl.play().catch(() => {});
-    }
   }
 
   // ---------- Daten laden ----------
 
   _scheduleFetch() {
-    if (this._fetchDebounce) clearTimeout(this._fetchDebounce);
-    this._fetchDebounce = setTimeout(() => this._fetchVisiblePeriods(), 250);
+    clearTimeout(this._fetchDebounce);
+    this._fetchDebounce = setTimeout(() => {
+      this._fetchDebounce = null;
+      this._fetchVisiblePeriods();
+    }, 250);
   }
 
   _dayKey(ms) {
     return new Date(ms).toISOString().slice(0, 10);
   }
 
-  async _fetchVisiblePeriods() {
-    const camId = this.resolveCameraId();
-    if (!camId) return;
+  _scheduleTimelineRetry(delay) {
+    const deadline = Date.now() + delay;
+    if (this._timelineRetryTimer !== null && this._timelineRetryAt <= deadline) return;
+    clearTimeout(this._timelineRetryTimer);
+    this._timelineRetryAt = deadline;
+    this._timelineRetryTimer = setTimeout(() => {
+      this._timelineRetryTimer = null;
+      this._fetchVisiblePeriods();
+    }, delay);
+  }
 
-    // Etwas Puffer links/rechts laden, damit Pan nicht sofort nachlädt
+  async _fetchVisiblePeriods() {
+    const { signal } = this._listeners;
+    const camera = this._cameraServiceData();
+    if (!camera) return;
+
     const bufferMs = (this._viewEnd - this._viewStart) * 0.5;
     const from = this._viewStart - bufferMs;
     const to = this._viewEnd + bufferMs;
-
     const dayMs = 24 * 60 * 60 * 1000;
-    const days = [];
-    for (let t = Math.floor(from / dayMs) * dayMs; t < to; t += dayMs) {
-      days.push(t);
-    }
-
-    for (const dayStart of days) {
-      const key = `${camId}_${this._dayKey(dayStart)}`;
-      if (this._periodsCache.has(key) || this._pendingFetches.has(key)) continue;
+    const requests = [];
+    const keys = [];
+    let hasMore = false;
+    for (let dayStart = Math.floor(from / dayMs) * dayMs; dayStart < to; dayStart += dayMs) {
+      const key = `${camera.camera_id}_${this._dayKey(dayStart)}`;
+      keys.push(key);
+      const cached = this._periodsCache.get(key);
+      if (this._pendingFetches.has(key) || (cached && !cached.retryAt)) continue;
+      if (cached?.retryAt > Date.now()) {
+        this._scheduleTimelineRetry(cached.retryAt - Date.now());
+        continue;
+      }
+      if (this._pendingFetches.size >= TIMELINE_REQUEST_LIMIT) {
+        hasMore = true;
+        continue;
+      }
       this._pendingFetches.add(key);
+      requests.push(this._fetchTimelineDay(camera, key, dayStart, dayStart + dayMs, signal));
+    }
+    this._visibleTimelineKeys = keys;
+    await Promise.all(requests);
+    if (signal.aborted) return;
+    if (hasMore) this._scheduleTimelineRetry(requests.length ? 0 : 1000);
+    const hasError = this._visibleTimelineKeys.some((key) => this._periodsCache.get(key)?.retryAt);
+    this.timelineErrorEl.innerText = hasError ? 'Zeitleiste vorübergehend unvollständig.' : '';
+  }
 
-      const dayEnd = dayStart + dayMs;
-      this._hass.callWS({
+  async _fetchTimelineDay(camera, key, start, end, signal) {
+    let data;
+    try {
+      const result = await this._hass.callWS({
         type: 'call_service',
         domain: 'wisenet_wave',
         service: 'get_timeline',
-        service_data: { camera_id: camId, start_ms: dayStart, end_ms: dayEnd },
+        service_data: { ...camera, start_ms: start, end_ms: end },
         return_response: true,
-      }).then((response) => {
-        const data = response?.response || { recording: [], motion: [] };
-        this._periodsCache.set(key, data);
-        this._pendingFetches.delete(key);
-        console.info(
-          `[wisenet-wave-card] Periods für ${key}: recording=${data.recording?.length ?? 0}, motion=${data.motion?.length ?? 0}, error=${data.error ?? 'keiner'}`,
-          data,
-        );
-        if (data.error) {
-          console.warn('wisenet_wave: Zeitleisten-Daten (Aufnahme/Bewegung) fehlgeschlagen:', data.error);
-          if (!this._timelineErrorShown) {
-            this._timelineErrorShown = true;
-            this.errorEl.innerText = 'Aufnahme-/Bewegungsanzeige nicht verfügbar (Details im HA-Log unter "wisenet_wave").';
-          }
-        }
-        this._drawTimeline();
-      }).catch((err) => {
-        console.warn('wisenet_wave: konnte Zeitleisten-Daten nicht laden', err);
-        this._periodsCache.set(key, { recording: [], motion: [] }); // nicht endlos neu versuchen
-        this._pendingFetches.delete(key);
       });
+      data = result?.response ?? { error: 'Leere Antwort' };
+    } catch (error) {
+      data = { error };
     }
+    if (signal.aborted) return;
+
+    this._pendingFetches.delete(key);
+    if (data.error) {
+      console.warn('wisenet_wave: Zeitleistenabfrage fehlgeschlagen', data.error);
+      const previous = this._periodsCache.get(key);
+      data.recording = data.recording?.length ? data.recording : previous?.recording ?? [];
+      data.motion = data.motion?.length ? data.motion : previous?.motion ?? [];
+      const retryDelay = Math.min((previous?.retryDelay ?? TIMELINE_RETRY_MS / 2) * 2, 120000);
+      data.retryAt = Date.now() + retryDelay;
+      data.retryDelay = retryDelay;
+      this._scheduleTimelineRetry(retryDelay);
+    }
+    this._periodsCache.set(key, data);
+    this._drawTimeline();
   }
 
   // ---------- Zeichnen ----------
@@ -732,20 +856,26 @@ class WisenetWaveCard extends HTMLElement {
   // ---------- Wiedergabe ----------
 
   async seekTo(timestampMs, options = {}) {
+    this._clearHlsRetry();
+    this._hlsRetryCount = 0;
+    const token = ++this._activeStreamToken;
+
     this.errorEl.innerText = '';
     this._playheadMs = timestampMs;
-    this._isLive = options.isLive === true || Math.abs(Date.now() - timestampMs) < 15000;
+    this._isLive = options.isLive ?? (Math.abs(Date.now() - timestampMs) < 15000);
     this._streamMode = this._isLive ? 'live' : 'archive';
+    this._resumePaused = options.autoplay === false;
     this._syncVideoUi();
-    this._hlsRetryCount = 0;
-    this._clearHlsRetry();
-    this._activeStreamToken += 1;
-    this._currentStreamUrl = null;
     this._updateTimeLabel();
     this._drawTimeline();
+    await this._requestStream(timestampMs, this._streamMode, token);
+  }
 
-    const camId = this.resolveCameraId();
-    if (!camId) return;
+  async _requestStream(timestampMs, mode, token) {
+    this._releasePlayer();
+    const camera = this._cameraServiceData();
+    this._waitingForCamera = !camera;
+    if (!camera) return;
 
     try {
       const response = await this._hass.callWS({
@@ -753,125 +883,116 @@ class WisenetWaveCard extends HTMLElement {
         domain: 'wisenet_wave',
         service: 'get_archive',
         service_data: {
-          camera_id: camId,
+          ...camera,
           timestamp_ms: Math.round(timestampMs),
-          stream_mode: this._streamMode,
+          stream_mode: mode,
         },
         return_response: true,
       });
+      if (token !== this._activeStreamToken) return;
+
       const url = response.response.url;
-      this._currentStreamUrl = url;
-      this._streamStartMs = this._isLive ? Date.now() : timestampMs;
-      this._startLoadWatchdog();
-      this.initHlsPlayer(url, { mode: this._streamMode, token: this._activeStreamToken });
-    } catch (err) {
-      console.error(err);
-      this.errorEl.innerText = 'Fehler beim Abrufen der Stream-URL. Siehe Konsole.';
+      if (!url) throw new Error('Keine Stream-URL');
+      this._streamStartMs = mode === 'live' ? Date.now() : timestampMs;
+      await this._initHlsPlayer(url, mode, token);
+    } catch (error) {
+      if (token !== this._activeStreamToken) return;
+      console.warn('wisenet_wave: Stream konnte nicht gestartet werden', error);
+      this._queueStreamRetry('Stream konnte nicht gestartet werden', token);
     }
   }
 
   _clearHlsRetry() {
-    if (this._hlsRetryTimer) {
-      clearTimeout(this._hlsRetryTimer);
-      this._hlsRetryTimer = null;
-    }
+    clearTimeout(this._hlsRetryTimer);
+    this._hlsRetryTimer = null;
   }
 
-  _handleHlsError(url, data, options = {}) {
-    const token = options.token ?? this._activeStreamToken;
-    if (token !== this._activeStreamToken) return;
-
-    const details = data?.details || '';
-    const isNetworkIssue = details.includes('NETWORK_ERROR') || details.includes('MEDIA_ERROR') || details.includes('MANIFEST_LOAD_ERROR') || details.includes('LEVEL_LOAD_ERROR');
-    const shouldRetry = (data?.fatal || isNetworkIssue) && this._hlsRetryCount < 3;
-
-    if (shouldRetry) {
-      this._hlsRetryCount += 1;
-      this._clearLoadWatchdog();
-      this.errorEl.innerText = `Stream vorübergehend nicht verfügbar, versuche erneut (${this._hlsRetryCount}/3)...`;
-      this._hlsRetryTimer = setTimeout(() => {
-        this._hlsRetryTimer = null;
-        this.initHlsPlayer(url, options);
-      }, 1000 * this._hlsRetryCount);
+  _queueStreamRetry(reason, token, cancelOnProgress = false) {
+    if (token !== this._activeStreamToken || this._resumePaused) return;
+    if (this._hlsRetryTimer !== null) {
+      if (!cancelOnProgress) this._cancelRetryOnProgress = false;
+      return;
+    }
+    this._clearLoadWatchdog();
+    const delay = HLS_RETRY_DELAYS[this._hlsRetryCount];
+    if (delay === undefined) {
+      this.errorEl.innerText = `HLS Fehler: ${reason}`;
       return;
     }
 
-    this._clearLoadWatchdog();
-    this.errorEl.innerText = `HLS Fehler: ${data?.type || details || 'network error'}`;
+    const mode = this._streamMode;
+    this._hlsRetryCount += 1;
+    this._cancelRetryOnProgress = cancelOnProgress;
+    this.errorEl.innerText = `Stream vorübergehend nicht verfügbar, versuche erneut (${this._hlsRetryCount}/${HLS_RETRY_DELAYS.length})...`;
+    this._hlsRetryTimer = setTimeout(() => {
+      this._hlsRetryTimer = null;
+      if (token !== this._activeStreamToken || this._resumePaused) return;
+      const timestamp = mode === 'live' ? Date.now() : this._playheadMs;
+      this._requestStream(timestamp, mode, token);
+    }, delay);
   }
 
-  async initHlsPlayer(url, options = {}) {
-    const token = options.token ?? this._activeStreamToken;
-
-    // Dynamisches Laden der HLS.js Bibliothek
-    if (!window.Hls) {
-      await new Promise((resolve) => {
-        const script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
-        script.onload = resolve;
-        document.head.appendChild(script);
-      });
+  _releasePlayer() {
+    this._clearLoadWatchdog();
+    this._stopPlayheadLoop();
+    this._currentStreamUrl = null;
+    this._streamStartMs = null;
+    const player = this.hls;
+    this.hls = null;
+    player?.destroy();
+    this.videoEl.pause();
+    if (this.videoEl.hasAttribute('src')) {
+      this.videoEl.removeAttribute('src');
+      this.videoEl.load();
     }
+  }
 
+  async _initHlsPlayer(url, mode, token) {
+    const nativeHls = this.videoEl.canPlayType('application/vnd.apple.mpegurl');
+    let Hls = window.Hls;
+    if (!Hls) {
+      try {
+        Hls = await loadHlsLibrary();
+      } catch (error) {
+        if (!nativeHls) throw error;
+      }
+    }
     if (token !== this._activeStreamToken) return;
 
-    if (Hls.isSupported()) {
-      if (this.hls) {
-        this.hls.destroy(); // Alten Stream beenden
-      }
-
-      this.hls = new Hls({
-        liveSyncDurationCount: 1,
-        liveMaxLatencyDurationCount: 3,
+    this._currentStreamUrl = url;
+    this._lastProgressTime = 0;
+    this._stablePlaybackStart = 0;
+    this._startLoadWatchdog();
+    if (Hls?.isSupported()) {
+      const player = new Hls({
+        liveSyncDurationCount: 3,
+        liveMaxLatencyDurationCount: 6,
         maxBufferLength: 20,
         maxBufferHole: 1.5,
-        liveDurationInfinity: options.mode === 'live',
+        liveDurationInfinity: mode === 'live',
         startPosition: -1,
       });
-
-      this.hls.loadSource(url);
-      this.hls.attachMedia(this.videoEl);
-      this.hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
-        if (token !== this._activeStreamToken) return;
-        this.errorEl.innerText = '';
-        this._clearLoadWatchdog();
-
-        // Diagnose: Die "meiste Pixel = richtige Stufe"-Annahme war falsch
-        // (die 4:3-Variante hat offenbar MEHR Pixel als die eigentlich
-        // gewünschte 16:9-Variante). Statt wieder zu raten, loggen wir hier
-        // erstmal ALLE verfügbaren Qualitätsstufen mit voller Auflösung +
-        // Bitrate, damit wir anhand echter Werte die richtige Stufe gezielt
-        // auswählen können - und lassen hls.js bis dahin wieder ganz normal
-        // per ABR automatisch wählen (kein erzwungenes currentLevel mehr).
-        if (data?.levels?.length) {
-          const levelInfo = data.levels
-            .map((lvl, idx) => `  [${idx}] ${lvl.width}x${lvl.height}, bitrate=${lvl.bitrate}, name=${lvl.name || lvl.attrs?.NAME || '-'}`)
-            .join('\n');
-          console.info(`[wisenet-wave-card] Verfügbare Qualitätsstufen:\n${levelInfo}`);
-        } else {
-          console.info('[wisenet-wave-card] Keine separaten Qualitätsstufen im Manifest gefunden (nur eine einzige Variante).');
+      this.hls = player;
+      player.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (token !== this._activeStreamToken || this.hls !== player) return;
+        if (!this._resumePaused) this.videoEl.play().catch(() => {});
+      });
+      player.on(Hls.Events.ERROR, (_event, data) => {
+        if (token !== this._activeStreamToken || this.hls !== player) return;
+        if (data.fatal) {
+          console.warn('wisenet_wave: HLS-Wiedergabe unterbrochen', data.details);
+          this._queueStreamRetry(data.details ?? data.type, token);
+        } else if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+          this._startLoadWatchdog();
         }
-
-        this.videoEl.play().catch(() => {});
       });
-
-      this.hls.on(Hls.Events.ERROR, (event, data) => {
-        this._handleHlsError(url, data, { ...options, token });
-      });
-
-      this.hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
-        if (token !== this._activeStreamToken) return;
-        const lvl = this.hls?.levels?.[data.level];
-        console.info(
-          `[wisenet-wave-card] Qualitätsstufe gewechselt zu [${data.level}]` +
-          (lvl ? ` ${lvl.width}x${lvl.height}` : ''),
-        );
-      });
-    } else if (this.videoEl.canPlayType('application/vnd.apple.mpegurl')) {
-      // Fallback für Apple Safari (Safari braucht oft keinen XHR Setup Trick, wenn Token als Cookie da ist,
-      // aber wir probieren es trotzdem, falls Safari nativ spielt).
+      player.loadSource(url);
+      player.attachMedia(this.videoEl);
+    } else if (nativeHls) {
       this.videoEl.src = url;
-      this.videoEl.play().catch(() => {});
+      if (!this._resumePaused) this.videoEl.play().catch(() => {});
+    } else {
+      throw new Error('Dieser Browser unterstützt keine HLS-Wiedergabe');
     }
   }
 
@@ -880,14 +1001,25 @@ class WisenetWaveCard extends HTMLElement {
     return 4;
   }
 
-  // Aufräumen, wenn die Karte aus dem DOM entfernt wird (z.B. Dashboard-
-  // Tab-Wechsel oder Karte gelöscht) - sonst bleibt der ResizeObserver
-  // aktiv und beobachtet ein bereits entferntes Element.
   disconnectedCallback() {
-    if (this._canvasResizeObserver) {
-      this._canvasResizeObserver.disconnect();
-      this._canvasResizeObserver = null;
-    }
+    if (!this._listeners) return;
+    this._listeners.abort();
+    this._listeners = null;
+    this._activeStreamToken += 1;
+
+    this._canvasResizeObserver?.disconnect();
+    this._canvasResizeObserver = null;
+    this._clearHlsRetry();
+    this._releasePlayer();
+    clearTimeout(this._fetchDebounce);
+    clearTimeout(this._timelineRetryTimer);
+    this._fetchDebounce = null;
+    this._timelineRetryTimer = null;
+    this._pendingFetches.clear();
+    this._dragState = null;
+    this._pinchState = null;
+
+    this.content = null;
   }
 }
 

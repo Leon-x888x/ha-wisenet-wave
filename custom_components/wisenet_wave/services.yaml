@@ -11,6 +11,12 @@ get_archive:
       example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
       selector:
         text:
+    config_entry_id:
+      name: WAVE-Server-Eintrag
+      description: Bei mehreren Servern optional. Ohne Angabe wird die Kamera-ID zugeordnet.
+      selector:
+        config_entry:
+          integration: wisenet_wave
     timestamp_ms:
       name: Zeitstempel (ms)
       description: >-
@@ -36,6 +42,12 @@ get_timeline:
       example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
       selector:
         text:
+    config_entry_id:
+      name: WAVE-Server-Eintrag
+      description: Bei mehreren Servern optional. Ohne Angabe wird die Kamera-ID zugeordnet.
+      selector:
+        config_entry:
+          integration: wisenet_wave
     start_ms:
       name: Start (ms)
       description: Unix-Zeitstempel in Millisekunden, Anfang des Zeitfensters.

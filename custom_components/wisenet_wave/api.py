@@ -1,9 +1,16 @@
 """API Client for Wisenet WAVE using Bearer Token Authentication."""
-import aiohttp
+import asyncio
 import logging
 import time
+from urllib.parse import quote
+
+import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
+
+class WisenetWaveConnectionError(Exception):
+    """WAVE could not provide the device list."""
+
 
 class WisenetWaveApiClient:
     def __init__(self, host: str, port: int, username: str, password: str, session: aiohttp.ClientSession):
@@ -15,6 +22,8 @@ class WisenetWaveApiClient:
         self.base_url = f"https://{host}:{port}"
         self._token = None
         self._token_expires_at = 0
+        self._login_retry_at = 0
+        self._login_lock = asyncio.Lock()
         # Manche WAVE-Server-Versionen akzeptieren am /hls/-Endpunkt keinen
         # Bearer-Token (nur klassische Basic-Auth). Sobald der Proxy das
         # einmal herausgefunden hat, merken wir es uns hier, damit nicht
@@ -24,7 +33,7 @@ class WisenetWaveApiClient:
         # Hauptursache für die spürbaren Latenzen/Aussetzer im Player.
         self.hls_prefers_basic_auth = False
 
-    async def async_login(self) -> bool:
+    async def _login(self) -> bool:
         """Authenticate with Wisenet WAVE 6.x and retrieve a Bearer token."""
         url = f"{self.base_url}/rest/v4/login/sessions"
         payload = {
@@ -38,7 +47,7 @@ class WisenetWaveApiClient:
                     data = await response.json()
                     self._token = data.get("token")
                     if self._token:
-                        self._token_expires_at = time.time() + 55 * 60
+                        self._token_expires_at = time.monotonic() + 55 * 60
                         return True
                     return False
                 return False
@@ -46,48 +55,64 @@ class WisenetWaveApiClient:
             _LOGGER.error("Error logging in to Wisenet WAVE: %s", err)
             return False
 
-    async def _get_headers(self, force_refresh: bool = False) -> dict:
-        """Ensure we have a valid token and return authorization headers."""
-        if force_refresh or not self._token or time.time() >= self._token_expires_at:
-            await self.async_login()
-        if self._token:
+    async def _get_headers(self, rejected_token: str | None = None) -> dict:
+        """Reuse a valid token or serialize the login for concurrent requests."""
+        async with self._login_lock:
+            now = time.monotonic()
+            if self._token and self._token_expires_at > now:
+                authorization = f"Bearer {self._token}"
+                if authorization != rejected_token:
+                    return {"Authorization": authorization}
+
+            self._token = None
+            if now < self._login_retry_at:
+                return {}
+            if not await self._login():
+                self._login_retry_at = time.monotonic() + 2
+                return {}
+            self._login_retry_at = 0
             return {"Authorization": f"Bearer {self._token}"}
-        return {}
 
     async def async_test_connection(self) -> bool:
-        """Test authentication and connectivity using devices endpoint."""
-        if not await self.async_login():
-            return False
-            
-        url = f"{self.base_url}/rest/v4/devices"
-        headers = await self._get_headers()
+        """Test authentication and connectivity using the devices endpoint."""
         try:
-            async with self.session.get(url, headers=headers, timeout=10, ssl=False) as response:
-                return response.status == 200
-        except Exception as err:
-            _LOGGER.error("Unexpected error connecting to Wisenet WAVE: %s", err)
+            await self.async_get_cameras()
+        except WisenetWaveConnectionError:
             return False
+        return True
 
-    async def async_get_cameras(self) -> list:
-        """Fetch list of devices/cameras from Wisenet WAVE."""
+    async def async_get_cameras(self) -> list[dict]:
+        """Fetch devices, distinguishing an empty list from a failed request."""
         headers = await self._get_headers()
-        if not headers:
-            return []
-            
         url = f"{self.base_url}/rest/v4/devices"
         try:
-            async with self.session.get(url, headers=headers, timeout=10, ssl=False) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return [dev for dev in data if dev.get("deviceType") in ("Camera", "IO")]
-                return []
-        except Exception as err:
-            _LOGGER.error("Error fetching cameras: %s", err)
-            return []
+            for attempt in range(2):
+                if not headers:
+                    raise WisenetWaveConnectionError("Could not log in to Wisenet WAVE")
+                async with self.session.get(
+                    url, headers=headers, timeout=10, ssl=False
+                ) as response:
+                    if response.status not in (401, 403) or attempt:
+                        response.raise_for_status()
+                        devices = await response.json()
+                        break
+                headers = await self._get_headers(headers["Authorization"])
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            raise WisenetWaveConnectionError("Could not fetch Wisenet WAVE devices") from err
+
+        if not isinstance(devices, list):
+            raise WisenetWaveConnectionError("Invalid Wisenet WAVE device list")
+        return [
+            device for device in devices
+            if isinstance(device, dict)
+            and device.get("deviceType") in ("Camera", "IO")
+            and isinstance(device.get("id"), str)
+            and device["id"]
+        ]
 
     async def async_get_recorded_periods(
         self, camera_id: str, start_ms: int, end_ms: int, periods_type: str = "recording"
-    ) -> list:
+    ) -> tuple[list, str | None]:
         """
         Holt Aufnahme- bzw. Bewegungs-Zeiträume für eine Kamera in einem Zeitfenster.
 
@@ -115,7 +140,7 @@ class WisenetWaveApiClient:
         span_ms = max(end_ms - start_ms, 1)
         detail = max(60_000, min(span_ms // 1000, 3_600_000))
 
-        url = f"{self.base_url}/rest/v4/devices/{camera_id}/footage"
+        url = f"{self.base_url}/rest/v4/devices/{quote(camera_id, safe='')}/footage"
         params = {
             "startTimeMs": str(start_ms),
             "endTimeMs": str(end_ms),
@@ -127,8 +152,9 @@ class WisenetWaveApiClient:
             # Gesamten Bildbereich als Bewegungsfenster durchsuchen.
             params["motion"] = "0,0,1x1"
 
+        rejected_token = None
         for attempt in range(2):
-            headers = await self._get_headers(force_refresh=attempt > 0)
+            headers = await self._get_headers(rejected_token)
             if not headers:
                 return [], "Keine gültige Authentifizierung (Login fehlgeschlagen)"
 
@@ -137,8 +163,7 @@ class WisenetWaveApiClient:
                     url, headers=headers, params=params, timeout=15, ssl=False
                 ) as response:
                     if response.status in (401, 403):
-                        self._token = None
-                        self._token_expires_at = 0
+                        rejected_token = headers["Authorization"]
                         _LOGGER.warning(
                             "wisenet_wave: Token für footage (%s) für %s ungültig, versuche erneut",
                             periods_type, camera_id,

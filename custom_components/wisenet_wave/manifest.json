@@ -3,6 +3,7 @@
   "name": "Wisenet WAVE",
   "codeowners": ["@Leon-x888x"],
   "config_flow": true,
+  "dependencies": ["http"],
   "documentation": "https://github.com/Leon-x888x/ha-wisenet-wave",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/Leon-x888x/ha-wisenet-wave/issues",

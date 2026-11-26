@@ -31,11 +31,12 @@ class WisenetWaveProxyView(HomeAssistantView):
         self.hass = hass
 
     async def get(self, request: web.Request, entry_id: str, path: str) -> web.Response:
-        client = self.hass.data.get(DOMAIN, {}).get(entry_id)
-        if client is None:
+        entry_data = self.hass.data.get(DOMAIN, {}).get(entry_id)
+        if entry_data is None:
             return web.Response(status=404, text="Unknown Wisenet WAVE entry")
 
-        target_url = f"{client.base_url}/{path}"
+        client = entry_data.client
+        target_url = f"{client.base_url}/{urllib.parse.quote(path, safe='/')}"
 
         # Strip HA's own signed-URL params (authSig is only meant for HA's
         # own auth validation, never for the WAVE server). Forwarding it
@@ -49,98 +50,58 @@ class WisenetWaveProxyView(HomeAssistantView):
         if upstream_params:
             target_url += f"?{urllib.parse.urlencode(upstream_params)}"
 
-        # Bug-Fix-Versuch: Der /hls/-Streaming-Endpunkt von Wisenet WAVE
-        # akzeptiert auf manchen Server-Versionen KEINEN Bearer-Token aus der
-        # REST-v4-Login-API, sondern verlangt klassische HTTP-Basic-Auth
-        # (Username/Passwort). Bisher haben wir hier ausschließlich Bearer
-        # geschickt, was ohne jede Exception in unserem Code mit HTTP
-        # 502/404 vom WAVE-Server selbst quittiert wurde (kein Log-Eintrag,
-        # weil das eine "normale" HTTP-Antwort ist, keine Exception).
-        # Strategie: erst Bearer versuchen (mit einem Retry bei 401/403 nach
-        # Token-Refresh, wie bisher), und falls das WEITERHIN mit
-        # 401/403/404/502 fehlschlägt, einmal zusätzlich mit Basic-Auth
-        # probieren, bevor wir endgültig aufgeben.
-        # Bug-Fix: Reihenfolge/Anzahl der Versuche hängt jetzt davon ab, ob
-        # wir für DIESEN Client (= diesen WAVE-Server) bereits wissen, dass
-        # Basic-Auth nötig ist. Ohne das musste bisher buchstäblich JEDE
-        # Playlist- und Segment-Anfrage eines Live-Streams (alle paar
-        # Sekunden, pro Kamera!) erst zwei erfolglose Bearer-Versuche
-        # (inkl. eines echten Login-Requests beim force_refresh) durchlaufen,
-        # bevor die eigentlich funktionierende Basic-Auth probiert wurde.
-        # Diese wiederholte, unnötige Latenz pro Request ist der
-        # wahrscheinlichste Grund für die immer wiederkehrenden HLS-Aussetzer
-        # ("stoppt einfach", "geht aus Live raus") - hls.js' eigene
-        # Netzwerk-Timeouts greifen dann, obwohl der Stream an sich in
-        # Ordnung wäre, es hat nur zu lange gedauert.
-        if client.hls_prefers_basic_auth:
-            auth_attempts = [
-                {"force_refresh": False, "basic": True},
-                {"force_refresh": False, "basic": False},
-                {"force_refresh": True, "basic": False},
-            ]
-        else:
-            auth_attempts = [
-                {"force_refresh": False, "basic": False},
-                {"force_refresh": True, "basic": False},
-                {"force_refresh": False, "basic": True},
-            ]
+        # WAVE servers can require Basic auth for HLS even when REST uses Bearer.
+        auth_attempts = ("basic", "bearer", "refresh") if client.hls_prefers_basic_auth else (
+            "bearer", "refresh", "basic"
+        )
+        rejected_token = None
+        upstream_response = None
 
-        last_resp_status = None
-        last_resp_body = None
-        last_resp_content_type = None
-
-        for attempt_info in auth_attempts:
+        for attempt in auth_attempts:
             request_kwargs = {"ssl": False, "timeout": 15}
-            if attempt_info["basic"]:
+            headers = {}
+            if attempt == "basic":
                 request_kwargs["auth"] = aiohttp.BasicAuth(client.username, client.password)
-                headers = {}
             else:
-                headers = await client._get_headers(force_refresh=attempt_info["force_refresh"])
+                if attempt == "refresh" and rejected_token is None:
+                    continue
+                headers = await client._get_headers(rejected_token)
+                if not headers:
+                    continue
+            if (byte_range := request.headers.get("Range")) is not None:
+                headers["Range"] = byte_range
             try:
                 async with client.session.get(
                     target_url, headers=headers, **request_kwargs
                 ) as resp:
+                    body = await resp.read()
+                    response_headers = {
+                        key: resp.headers[key]
+                        for key in ("Content-Type", "Content-Range", "Accept-Ranges", "Retry-After")
+                        if key in resp.headers
+                    }
                     if resp.status in (401, 403, 404, 502):
-                        if resp.status in (401, 403):
-                            client._token = None
-                            client._token_expires_at = 0
-                        last_resp_status = resp.status
-                        last_resp_body = await resp.read()
-                        last_resp_content_type = resp.headers.get("Content-Type", "text/plain")
+                        if resp.status in (401, 403) and attempt == "bearer":
+                            rejected_token = headers["Authorization"]
+                        upstream_response = web.Response(
+                            body=body, status=resp.status, headers=response_headers
+                        )
                         continue
 
-                    body = await resp.read()
-                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
-
-                    if path.endswith(".m3u8"):
-                        body = self._rewrite_playlist(body, entry_id)
-
-                    if attempt_info["basic"] and not client.hls_prefers_basic_auth:
-                        _LOGGER.info(
-                            "wisenet_wave: /hls/-Endpunkt hat mit Basic-Auth funktioniert, "
-                            "nicht mit Bearer-Token (%s). Folgeanfragen versuchen ab jetzt "
-                            "direkt Basic-Auth zuerst.", target_url,
-                        )
-                    # Erfolgreiche Methode merken, damit künftige Requests
-                    # (nächstes Segment, nächste Playlist-Aktualisierung ...)
-                    # nicht wieder unnötig mit der falschen Methode starten.
-                    client.hls_prefers_basic_auth = attempt_info["basic"]
-
-                    return web.Response(body=body, status=resp.status, content_type=content_type)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Wisenet WAVE proxy error for %s: %s", target_url, err)
+                    if resp.status < 300:
+                        client.hls_prefers_basic_auth = attempt == "basic"
+                        if resp.status == 200 and path.endswith(".m3u8"):
+                            body = self._rewrite_playlist(body, entry_id, path)
+                    return web.Response(body=body, status=resp.status, headers=response_headers)
+            except (aiohttp.ClientError, TimeoutError) as err:
+                _LOGGER.warning("Wisenet WAVE HLS request failed for %s: %s", path, err)
                 return web.Response(status=502, text="Bad Gateway (Wisenet WAVE unreachable)")
 
-        # Alle Auth-Varianten fehlgeschlagen - die letzte Antwort vom
-        # WAVE-Server durchreichen (statt eines generischen 502), damit man
-        # in der Karte/den Dev-Tools sieht, was der Server WIRKLICH zurückgibt.
-        return web.Response(
-            body=last_resp_body or b"",
-            status=last_resp_status or 502,
-            content_type=last_resp_content_type or "text/plain",
-        )
+        if upstream_response is not None:
+            return upstream_response
+        return web.Response(status=502, text="Could not authenticate with Wisenet WAVE")
 
-    def _rewrite_playlist(self, body: bytes, entry_id: str) -> bytes:
+    def _rewrite_playlist(self, body: bytes, entry_id: str, playlist_path: str) -> bytes:
         """Rewrite segment/sub-playlist URIs in an m3u8 to point back through the proxy.
 
         Every rewritten line is itself signed, so the browser never needs to
@@ -153,18 +114,11 @@ class WisenetWaveProxyView(HomeAssistantView):
         for line in text.splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
-                if stripped.startswith("http://") or stripped.startswith("https://"):
-                    parsed = urllib.parse.urlparse(stripped)
-                    rel_path = parsed.path.lstrip("/")
-                    query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-                else:
-                    parts = stripped.split("?", 1)
-                    rel_path = parts[0].lstrip("/")
-                    query_pairs = (
-                        urllib.parse.parse_qsl(parts[1], keep_blank_values=True)
-                        if len(parts) > 1
-                        else []
-                    )
+                # Some WAVE manifests use server-relative hls/ paths without a slash.
+                reference = "/" + stripped if stripped.startswith("hls/") else stripped
+                parsed = urllib.parse.urlsplit(urllib.parse.urljoin(f"/{playlist_path}", reference))
+                rel_path = parsed.path.lstrip("/")
+                query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
 
                 # Drop any authSig that may already be present (e.g. because
                 # this line came from a nested/live sub-playlist that already

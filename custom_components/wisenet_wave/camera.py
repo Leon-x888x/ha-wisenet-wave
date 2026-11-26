@@ -14,10 +14,8 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up camera entities from Wisenet WAVE API."""
-    client = hass.data[DOMAIN][entry.entry_id]
-    raw_cameras = await client.async_get_cameras()
-
-    entities = [WisenetWaveCamera(client, cam, entry) for cam in raw_cameras]
+    data = hass.data[DOMAIN][entry.entry_id]
+    entities = [WisenetWaveCamera(data.client, camera, entry) for camera in data.cameras]
     async_add_entities(entities)
 
 
@@ -38,7 +36,10 @@ class WisenetWaveCamera(Camera):
     @property
     def extra_state_attributes(self):
         """Expose the internal Wisenet WAVE camera id for use by the Lovelace card."""
-        return {"wisenet_camera_id": self._cam_id}
+        return {
+            "wisenet_camera_id": self._cam_id,
+            "wisenet_entry_id": self.entry.entry_id,
+        }
 
     @property
     def device_info(self) -> DeviceInfo:
