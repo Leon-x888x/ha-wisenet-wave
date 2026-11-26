@@ -2,12 +2,16 @@
 // einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
 // läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
 // die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-11-26-videozoom geladen');
+console.info('[wisenet-wave-card] Version 2026-11-26-desktop geladen');
 
 const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const TIMELINE_RETRY_MS = 15000;
 const TIMELINE_REQUEST_LIMIT = 4;
 const VIDEO_ZOOM_LEVELS = [1, 1.5, 2, 3, 4];
+const PLAYHEAD_UPDATE_MS = 125;
+const PLAYBACK_CHECK_MS = 1000;
+const PLAYBACK_STALL_MS = 7000;
+const VIDEO_FRAME_STALL_MS = 12000;
 let hlsLibraryPromise;
 
 function loadHlsLibrary() {
@@ -58,6 +62,7 @@ class WisenetWaveCard extends HTMLElement {
     this._fetchDebounce = null;
     this._rafId = null;
     this._loadWatchdogId = null;
+    this._playbackMonitor = null;
     this._timelineRetryTimer = null;
     this._timelineRetryAt = 0;
     this._hlsRetryTimer = null;
@@ -306,7 +311,7 @@ class WisenetWaveCard extends HTMLElement {
       if (this.videoEl.paused) {
         this._resumePaused = false;
         if (this._currentStreamUrl && !this.videoEl.error && this._hlsRetryTimer === null) {
-          this.videoEl.play().catch(() => {});
+          this._playVideo();
         } else {
           this.seekTo(this._playheadMs, { isLive: false });
         }
@@ -363,6 +368,33 @@ class WisenetWaveCard extends HTMLElement {
     reset.addEventListener('click', () => this._setVideoZoom(0), { signal });
     this.videoEl.addEventListener('resize', () => this._renderVideoZoom(), { signal });
 
+    let wheelDelta = 0;
+    let lastWheelAt = 0;
+    wrap.addEventListener('wheel', (event) => {
+      const mode = event.deltaMode;
+      const { deltaX, deltaY } = event;
+      if (event.ctrlKey || event.metaKey || !deltaY || Math.abs(deltaX) > Math.abs(deltaY)) return;
+      const step = deltaY < 0 ? 1 : -1;
+      const index = this._videoZoomIndex + step;
+      if (index < 0 || index >= VIDEO_ZOOM_LEVELS.length) {
+        wheelDelta = 0;
+        return;
+      }
+      const { width, height } = this._videoImageSize();
+      const rect = wrap.getBoundingClientRect();
+      if (!width || !height || !rect.width || !rect.height) return;
+      event.preventDefault();
+      const now = performance.now();
+      if (now - lastWheelAt > 180 || Math.sign(wheelDelta) !== Math.sign(deltaY)) wheelDelta = 0;
+      lastWheelAt = now;
+      wheelDelta += deltaY * (mode === 1 ? 16 : mode === 2 ? wrap.clientHeight : 1);
+      if (Math.abs(wheelDelta) < 40) return;
+      wheelDelta = 0;
+      const x = ((event.clientX - rect.left) / rect.width - 0.5) * wrap.clientWidth / width;
+      const y = ((event.clientY - rect.top) / rect.height - 0.5) * wrap.clientHeight / height;
+      this._setVideoZoom(index, x, y);
+    }, { passive: false, signal });
+
     let drag = null;
     wrap.addEventListener('pointerdown', (event) => {
       if (!this._videoZoomIndex || drag || event.button !== 0 || event.target.closest('.wwc-video-zoom')) return;
@@ -388,12 +420,12 @@ class WisenetWaveCard extends HTMLElement {
     this._renderVideoZoom();
   }
 
-  _setVideoZoom(index) {
+  _setVideoZoom(index, anchorX = 0, anchorY = 0) {
     const previous = VIDEO_ZOOM_LEVELS[this._videoZoomIndex];
     this._videoZoomIndex = Math.max(0, Math.min(VIDEO_ZOOM_LEVELS.length - 1, index));
     const ratio = VIDEO_ZOOM_LEVELS[this._videoZoomIndex] / previous;
-    this._videoOffsetX *= ratio;
-    this._videoOffsetY *= ratio;
+    this._videoOffsetX += (this._videoOffsetX - anchorX) * (ratio - 1);
+    this._videoOffsetY += (this._videoOffsetY - anchorY) * (ratio - 1);
     this._renderVideoZoom();
   }
 
@@ -431,40 +463,14 @@ class WisenetWaveCard extends HTMLElement {
     this.videoEl.addEventListener('play', () => {
       this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:pause');
       this._startPlayheadLoop();
-      if (this._currentStreamUrl && this.videoEl.readyState < 3) this._startLoadWatchdog();
+      this._startLoadWatchdog();
     }, { signal });
     this.videoEl.addEventListener('pause', () => {
       this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', 'mdi:play');
       this._stopPlayheadLoop();
     }, { signal });
-    this.videoEl.addEventListener('playing', () => {
-      this._lastProgressTime = this.videoEl.currentTime;
-    }, { signal });
-    this.videoEl.addEventListener('timeupdate', () => {
-      const video = this.videoEl;
-      if (!this._currentStreamUrl || video.paused || video.seeking || video.readyState < 2) return;
-      if (video.currentTime <= this._lastProgressTime) return;
-      this._lastProgressTime = video.currentTime;
-      this._clearLoadWatchdog();
-      if (this._hlsRetryTimer !== null && !this._cancelRetryOnProgress) return;
-      this._clearHlsRetry();
-      if (video.currentTime >= this._stablePlaybackStart + 10) {
-        this._hlsRetryCount = 0;
-        this._stablePlaybackStart = video.currentTime;
-      }
-      if (this.errorEl.innerText.startsWith('HLS Fehler') || this.errorEl.innerText.startsWith('Stream vorübergehend')) {
-        this.errorEl.innerText = '';
-      }
-    }, { signal });
-    for (const event of ['waiting', 'stalled']) {
-      this.videoEl.addEventListener(event, () => {
-        if (this._currentStreamUrl && !this.videoEl.paused && !this.videoEl.seeking) {
-          this._startLoadWatchdog();
-        }
-      }, { signal });
-    }
     this.videoEl.addEventListener('error', () => {
-      if (!this.hls && this._currentStreamUrl && this.videoEl.error) {
+      if (this._currentStreamUrl && this.videoEl.error) {
         this._queueStreamRetry('Videofehler', this._activeStreamToken);
       }
     }, { signal });
@@ -498,18 +504,85 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _startLoadWatchdog() {
-    if (this._loadWatchdogId !== null || this._resumePaused) return;
-    const token = this._activeStreamToken;
-    this._loadWatchdogId = setTimeout(() => {
-      this._loadWatchdogId = null;
-      if (this.videoEl.ended || (this.videoEl.paused && this.videoEl.readyState >= 2)) return;
-      this._queueStreamRetry('Wiedergabe steht still', token, true);
-    }, 9000);
+    if (this._loadWatchdogId !== null || !this._currentStreamUrl || this._resumePaused) return;
+    const now = performance.now();
+    this._playbackMonitor = {
+      checkedAt: now,
+      time: this.videoEl.currentTime,
+      timeAdvancedAt: now,
+      frames: null,
+      framesAdvancedAt: now,
+      stableSince: null,
+      autoplayBlocked: false,
+    };
+    this._loadWatchdogId = setInterval(() => this._checkPlayback(), PLAYBACK_CHECK_MS);
+  }
+
+  _playVideo() {
+    this._startLoadWatchdog();
+    const monitor = this._playbackMonitor;
+    if (monitor) monitor.autoplayBlocked = false;
+    this.videoEl.play().catch((error) => {
+      if (error.name === 'NotAllowedError' && monitor && this._playbackMonitor === monitor) {
+        monitor.autoplayBlocked = true;
+      }
+    });
+  }
+
+  _checkPlayback() {
+    const video = this.videoEl;
+    const monitor = this._playbackMonitor;
+    const now = performance.now();
+    const frameCounts = video.videoWidth ? video.getVideoPlaybackQuality?.() : null;
+    const frames = frameCounts?.totalVideoFrames > 0 ?
+      frameCounts.totalVideoFrames - frameCounts.droppedVideoFrames : null;
+    const resumed = now - monitor.checkedAt > 3 * PLAYBACK_CHECK_MS;
+    monitor.checkedAt = now;
+
+    if (video.ended && this._streamMode === 'archive') {
+      this._clearLoadWatchdog();
+      return;
+    }
+    if (document.hidden || resumed || video.seeking || monitor.autoplayBlocked) {
+      monitor.time = video.currentTime;
+      monitor.frames = frames;
+      monitor.timeAdvancedAt = monitor.framesAdvancedAt = now;
+      monitor.stableSince = null;
+      return;
+    }
+
+    const advanced = !video.paused && Math.abs(video.currentTime - monitor.time) >= 0.05;
+    const frameAdvanced = frames === null || frames !== monitor.frames;
+    if (advanced) {
+      monitor.time = video.currentTime;
+      monitor.timeAdvancedAt = now;
+    }
+    if (frameAdvanced) {
+      monitor.frames = frames;
+      monitor.framesAdvancedAt = now;
+    }
+    if (advanced && frameAdvanced) {
+      if (this._hlsRetryTimer !== null && !this._cancelRetryOnProgress) return;
+      this._clearHlsRetry();
+      monitor.stableSince ??= now;
+      if (now - monitor.stableSince >= 10000) this._hlsRetryCount = 0;
+      if (this.errorEl.innerText.startsWith('HLS Fehler') || this.errorEl.innerText.startsWith('Stream vorübergehend')) {
+        this.errorEl.innerText = '';
+      }
+    } else {
+      monitor.stableSince = null;
+    }
+
+    if (now - monitor.timeAdvancedAt >= PLAYBACK_STALL_MS ||
+        now - monitor.framesAdvancedAt >= VIDEO_FRAME_STALL_MS) {
+      this._queueStreamRetry('Wiedergabe steht still', this._activeStreamToken, true);
+    }
   }
 
   _clearLoadWatchdog() {
-    clearTimeout(this._loadWatchdogId);
+    clearInterval(this._loadWatchdogId);
     this._loadWatchdogId = null;
+    this._playbackMonitor = null;
   }
 
   _syncVideoUi() {
@@ -541,8 +614,10 @@ class WisenetWaveCard extends HTMLElement {
 
   _startPlayheadLoop() {
     if (this._rafId) return;
-    const tick = () => {
-      if (this._streamStartMs != null && !this.videoEl.paused) {
+    let lastDraw = -Infinity;
+    const tick = (now) => {
+      if (now - lastDraw >= PLAYHEAD_UPDATE_MS && this._streamStartMs != null && !this.videoEl.paused) {
+        lastDraw = now;
         if (this._isLive) {
           const span = this._viewEnd - this._viewStart;
           const now = Date.now();
@@ -1012,9 +1087,9 @@ class WisenetWaveCard extends HTMLElement {
       if (!cancelOnProgress) this._cancelRetryOnProgress = false;
       return;
     }
-    this._clearLoadWatchdog();
     const delay = HLS_RETRY_DELAYS[this._hlsRetryCount];
     if (delay === undefined) {
+      this._clearLoadWatchdog();
       this.errorEl.innerText = `HLS Fehler: ${reason}`;
       return;
     }
@@ -1059,8 +1134,6 @@ class WisenetWaveCard extends HTMLElement {
     if (token !== this._activeStreamToken) return;
 
     this._currentStreamUrl = url;
-    this._lastProgressTime = 0;
-    this._stablePlaybackStart = 0;
     this._startLoadWatchdog();
     if (Hls?.isSupported()) {
       const player = new Hls({
@@ -1074,22 +1147,20 @@ class WisenetWaveCard extends HTMLElement {
       this.hls = player;
       player.on(Hls.Events.MANIFEST_PARSED, () => {
         if (token !== this._activeStreamToken || this.hls !== player) return;
-        if (!this._resumePaused) this.videoEl.play().catch(() => {});
+        if (!this._resumePaused) this._playVideo();
       });
       player.on(Hls.Events.ERROR, (_event, data) => {
         if (token !== this._activeStreamToken || this.hls !== player) return;
         if (data.fatal) {
           console.warn('wisenet_wave: HLS-Wiedergabe unterbrochen', data.details);
           this._queueStreamRetry(data.details ?? data.type, token);
-        } else if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
-          this._startLoadWatchdog();
         }
       });
       player.loadSource(url);
       player.attachMedia(this.videoEl);
     } else if (nativeHls) {
       this.videoEl.src = url;
-      if (!this._resumePaused) this.videoEl.play().catch(() => {});
+      if (!this._resumePaused) this._playVideo();
     } else {
       throw new Error('Dieser Browser unterstützt keine HLS-Wiedergabe');
     }
