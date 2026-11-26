@@ -1,10 +1,13 @@
-console.info('[wisenet-wave-card] Version 0.1.3 geladen');
+console.info('[wisenet-wave-card] Version 0.1.4 geladen');
 
 const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const HLS_RECOVERY_NOTICE_MS = 2500;
 const HLS_RECOVERY_NOTICE = 'Verbindung zum Stream wird wiederhergestellt …';
 const TIMELINE_RETRY_MS = 15000;
 const TIMELINE_REQUEST_LIMIT = 4;
+const TIMELINE_REFRESH_MS = 30000;
+const FULLSCREEN_CONTROLS_MS = 3000;
+const SEEK_STEP_MS = 10000;
 const VIDEO_ZOOM_LEVELS = [1, 1.5, 2, 3, 4];
 const PLAYHEAD_UPDATE_MS = 125;
 const PLAYBACK_CHECK_MS = 1000;
@@ -55,6 +58,7 @@ class WisenetWaveCard extends HTMLElement {
     this._viewStart = this._viewEnd - 60 * 60 * 1000; // Start: letzte Stunde
     this._playheadMs = this._viewEnd;
     this._isLive = true;
+    this._followLiveTimeline = true;
     this._periodsCache = new Map(); // Tagesschlüssel -> {recording:[], motion:[]}
     this._pendingFetches = new Set();
     this._dragState = null;
@@ -64,6 +68,8 @@ class WisenetWaveCard extends HTMLElement {
     this._loadWatchdogId = null;
     this._playbackMonitor = null;
     this._timelineRetryTimer = null;
+    this._timelineActive = false;
+    this._timelineWaitingForCamera = false;
     this._timelineRetryAt = 0;
     this._hlsRetryTimer = null;
     this._hlsRecoveryNoticeTimer = null;
@@ -74,7 +80,10 @@ class WisenetWaveCard extends HTMLElement {
     this._streamMode = 'live';
     this._waitingForCamera = false;
     this._playbackRequested = false;
-    this._previewVisible = false;
+    this._playbackPaused = false;
+    this._fullscreenControlsTimer = null;
+    this._seekFeedbackTimer = null;
+    this._cardVisible = false;
     this._previewTimer = null;
     this._previewRequest = null;
     this._previewObjectUrl = null;
@@ -129,6 +138,29 @@ class WisenetWaveCard extends HTMLElement {
         <ha-card>
           <style>
             .wwc-content { padding: 0 16px 16px; }
+            .wwc-player { position: relative; }
+            .wwc-player:fullscreen { width: 100%; height: 100%; background: #000; }
+            .wwc-player:fullscreen .wwc-video-wrap { height: 100%; border-radius: 0; aspect-ratio: auto; }
+            .wwc-player:fullscreen .wwc-video-zoom { top: 8px; bottom: auto; }
+            .wwc-player:fullscreen .wwc-player-controls {
+              position: absolute; inset: auto 0 0; padding: 24px 16px 12px;
+              padding-bottom: max(12px, env(safe-area-inset-bottom));
+              background: linear-gradient(transparent, rgba(0,0,0,0.92) 36%);
+              --primary-text-color: #fff; --secondary-text-color: #e0e0e0;
+              --divider-color: rgba(255,255,255,0.24);
+              color: #fff; transition: opacity 150ms;
+            }
+            .wwc-player:fullscreen.wwc-controls-hidden .wwc-player-controls:not(:focus-within):not(:hover) {
+              opacity: 0; pointer-events: none;
+            }
+            .wwc-seek-feedback {
+              position: absolute; top: 32%; left: 50%; transform: translateX(-50%);
+              padding: 8px 16px; border-radius: 999px; background: rgba(0,0,0,0.75);
+              color: #fff; font-size: 18px; font-variant-numeric: tabular-nums; pointer-events: none;
+            }
+            @media (prefers-reduced-motion: reduce) {
+              .wwc-player:fullscreen .wwc-player-controls { transition: none; }
+            }
             .wwc-video-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 4px; overflow: hidden; }
             .wwc-video-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
             .wwc-video-preview { display: none; position: absolute; inset: 0; pointer-events: none; }
@@ -187,6 +219,7 @@ class WisenetWaveCard extends HTMLElement {
             }
             .wwc-btn:hover { background: var(--divider-color, rgba(0,0,0,0.08)); }
             .wwc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+            .wwc-btn[hidden] { display: none; }
             .wwc-btn ha-icon { --mdc-icon-size: 20px; }
             .wwc-time { font-family: var(--code-font-family, monospace); font-size: 13px; color: var(--secondary-text-color); min-width: 120px; white-space: nowrap; }
             .wwc-spacer { flex: 1 1 0; min-width: 0; }
@@ -207,54 +240,62 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-zoom-controls { display: flex; gap: 4px; }
           </style>
           <div class="card-content wwc-content">
-            <div class="wwc-video-wrap">
-              <video id="wave-video" muted playsinline></video>
-              <div class="wwc-video-preview" aria-hidden="true"></div>
-              <div class="wwc-live-badge" id="wave-live-badge"><span class="wwc-live-badge-dot"></span>LIVE</div>
-              <button type="button" class="wwc-video-start" id="wave-video-start" aria-label="Video starten" title="Video starten"><ha-icon icon="mdi:play"></ha-icon></button>
-              <div class="wwc-video-zoom" role="group" aria-label="Videozoom">
-                <button type="button" class="wwc-btn" id="wave-video-zoom-out" title="Video verkleinern" aria-label="Video verkleinern"><ha-icon icon="mdi:minus"></ha-icon></button>
-                <button type="button" class="wwc-btn wwc-video-zoom-reset" id="wave-video-zoom-reset" title="Videozoom zurücksetzen">1×</button>
-                <button type="button" class="wwc-btn" id="wave-video-zoom-in" title="Video vergrößern" aria-label="Video vergrößern"><ha-icon icon="mdi:plus"></ha-icon></button>
-              </div>
-            </div>
-
-            <div class="wwc-toolbar">
-              <button class="wwc-btn" id="wave-skip-back" title="10s zurück"><ha-icon icon="mdi:rewind-10"></ha-icon></button>
-              <button type="button" class="wwc-btn" id="wave-play-pause" title="Stream starten" aria-label="Stream starten"><ha-icon icon="mdi:play"></ha-icon></button>
-              <button class="wwc-btn" id="wave-skip-fwd" title="10s vor"><ha-icon icon="mdi:fast-forward-10"></ha-icon></button>
-              <button class="wwc-btn" id="wave-mute" title="Stumm/Ton an"><ha-icon icon="mdi:volume-off"></ha-icon></button>
-              <button class="wwc-btn" id="wave-fullscreen" title="Vollbild"><ha-icon icon="mdi:fullscreen"></ha-icon></button>
-              <span class="wwc-time" id="wave-time-label">--</span>
-              <div class="wwc-spacer"></div>
-              <button class="wwc-live-btn" id="wave-live-btn"><span class="wwc-live-dot"></span>Live</button>
-            </div>
-
-            <div class="wwc-timeline-wrap">
-              <div class="wwc-timeline-labels" id="wave-timeline-labels"></div>
-              <canvas class="wwc-canvas" id="wave-canvas" height="46"></canvas>
-              <div class="wwc-legend">
-                <div class="wwc-legend-items">
-                  <span><span class="wwc-legend-dot" style="background:var(--success-color,#43a047)"></span>Aufnahme</span>
-                  <span><span class="wwc-legend-dot" style="background:var(--error-color,#db4437)"></span>Bewegung</span>
-                </div>
-                <div class="wwc-zoom-controls">
-                  <button class="wwc-btn" id="wave-zoom-out" title="Rauszoomen"><ha-icon icon="mdi:magnify-minus-outline"></ha-icon></button>
-                  <button class="wwc-btn" id="wave-zoom-in" title="Reinzoomen"><ha-icon icon="mdi:magnify-plus-outline"></ha-icon></button>
+            <div class="wwc-player" tabindex="-1">
+              <div class="wwc-video-wrap">
+                <video id="wave-video" muted playsinline></video>
+                <div class="wwc-video-preview" aria-hidden="true"></div>
+                <div class="wwc-live-badge" id="wave-live-badge"><span class="wwc-live-badge-dot"></span>LIVE</div>
+                <div class="wwc-seek-feedback" role="status" hidden></div>
+                <button type="button" class="wwc-video-start" id="wave-video-start" aria-label="Video starten" title="Video starten"><ha-icon icon="mdi:play"></ha-icon></button>
+                <div class="wwc-video-zoom" role="group" aria-label="Videozoom">
+                  <button type="button" class="wwc-btn" id="wave-video-zoom-out" title="Video verkleinern" aria-label="Video verkleinern"><ha-icon icon="mdi:minus"></ha-icon></button>
+                  <button type="button" class="wwc-btn wwc-video-zoom-reset" id="wave-video-zoom-reset" title="Videozoom zurücksetzen">1×</button>
+                  <button type="button" class="wwc-btn" id="wave-video-zoom-in" title="Video vergrößern" aria-label="Video vergrößern"><ha-icon icon="mdi:plus"></ha-icon></button>
                 </div>
               </div>
-            </div>
 
-            <div id="wave-timeline-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
-            <div id="wave-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
+              <div class="wwc-player-controls">
+                <div class="wwc-toolbar">
+                  <button type="button" class="wwc-btn" id="wave-skip-back" title="10 Sekunden zurück (←)" aria-keyshortcuts="ArrowLeft"><ha-icon icon="mdi:rewind-10"></ha-icon></button>
+                  <button type="button" class="wwc-btn" id="wave-play-pause" title="Stream starten" aria-label="Stream starten" aria-keyshortcuts="Space K"><ha-icon icon="mdi:play"></ha-icon></button>
+                  <button type="button" class="wwc-btn" id="wave-skip-fwd" title="10 Sekunden vor (→)" aria-keyshortcuts="ArrowRight"><ha-icon icon="mdi:fast-forward-10"></ha-icon></button>
+                  <button type="button" class="wwc-btn" id="wave-stop" title="Stream stoppen" aria-label="Stream stoppen" hidden><ha-icon icon="mdi:stop"></ha-icon></button>
+                  <button type="button" class="wwc-btn" id="wave-mute" title="Stumm/Ton an (M)" aria-keyshortcuts="M"><ha-icon icon="mdi:volume-off"></ha-icon></button>
+                  <button type="button" class="wwc-btn" id="wave-fullscreen" title="Vollbild (F)" aria-label="Vollbild" aria-keyshortcuts="F"><ha-icon icon="mdi:fullscreen"></ha-icon></button>
+                  <span class="wwc-time" id="wave-time-label">--</span>
+                  <div class="wwc-spacer"></div>
+                  <button class="wwc-live-btn" id="wave-live-btn"><span class="wwc-live-dot"></span>Live</button>
+                </div>
+
+                <div class="wwc-timeline-wrap">
+                  <div class="wwc-timeline-labels" id="wave-timeline-labels"></div>
+                  <canvas class="wwc-canvas" id="wave-canvas" height="46"></canvas>
+                  <div class="wwc-legend">
+                    <div class="wwc-legend-items">
+                      <span><span class="wwc-legend-dot" style="background:var(--success-color,#43a047)"></span>Aufnahme</span>
+                      <span><span class="wwc-legend-dot" style="background:var(--error-color,#db4437)"></span>Bewegung</span>
+                    </div>
+                    <div class="wwc-zoom-controls">
+                      <button class="wwc-btn" id="wave-zoom-out" title="Rauszoomen"><ha-icon icon="mdi:magnify-minus-outline"></ha-icon></button>
+                      <button class="wwc-btn" id="wave-zoom-in" title="Reinzoomen"><ha-icon icon="mdi:magnify-plus-outline"></ha-icon></button>
+                    </div>
+                  </div>
+                </div>
+
+                <div id="wave-timeline-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
+                <div id="wave-error" style="color: var(--error-color, red); margin-top: 8px; font-size: 12px;"></div>
+              </div>
+            </div>
           </div>
         </ha-card>
       `;
       this.querySelector('ha-card').setAttribute('header', this.config.title || 'Wisenet WAVE Archiv');
       this.content = this.querySelector('.card-content');
       this.videoEl = this.querySelector('#wave-video');
+      this.playerEl = this.querySelector('.wwc-player');
       this.videoWrapEl = this.querySelector('.wwc-video-wrap');
       this.previewEl = this.querySelector('.wwc-video-preview');
+      this.seekFeedbackEl = this.querySelector('.wwc-seek-feedback');
       this.errorEl = this.querySelector('#wave-error');
       this.timelineErrorEl = this.querySelector('#wave-timeline-error');
       this.canvasEl = this.querySelector('#wave-canvas');
@@ -262,6 +303,7 @@ class WisenetWaveCard extends HTMLElement {
       this.timeLabelEl = this.querySelector('#wave-time-label');
       this.liveBtnEl = this.querySelector('#wave-live-btn');
       this.playPauseBtnEl = this.querySelector('#wave-play-pause');
+      this.stopBtnEl = this.querySelector('#wave-stop');
       this.startVideoBtnEl = this.querySelector('#wave-video-start');
       this.liveBadgeEl = this.querySelector('#wave-live-badge');
 
@@ -269,7 +311,7 @@ class WisenetWaveCard extends HTMLElement {
       this._setupVideoZoom();
       this._setupTimelineInteraction();
       this._setupVideoEvents();
-      this._setupPreview();
+      this._observeCardVisibility();
       this._syncVideoUi();
 
       this._resizeCanvas();
@@ -283,6 +325,7 @@ class WisenetWaveCard extends HTMLElement {
       }, { signal });
       document.addEventListener('visibilitychange', () => {
         this._syncPreview();
+        this._syncTimeline();
         if (document.visibilityState === 'visible') {
           this._refreshVideoLayout();
         }
@@ -317,22 +360,24 @@ class WisenetWaveCard extends HTMLElement {
         });
       }
 
-    } else if (this._playbackRequested && this._waitingForCamera && this._cameraServiceData()) {
+    } else if (this._playbackRequested && !this._playbackPaused && this._waitingForCamera && this._cameraServiceData()) {
       this._startPlayback();
     }
     this._syncPreview();
+    this._syncTimeline();
   }
 
-  _setupPreview() {
-    this._previewVisible = !window.IntersectionObserver;
+  _observeCardVisibility() {
+    this._cardVisible = !window.IntersectionObserver;
     if (!window.IntersectionObserver) return;
     const observer = new IntersectionObserver(([entry]) => {
-      if (this._previewObserver !== observer) return;
-      this._previewVisible = entry.isIntersecting;
+      if (this._visibilityObserver !== observer) return;
+      this._cardVisible = entry.isIntersecting;
       this._syncPreview();
+      this._syncTimeline();
     });
-    this._previewObserver = observer;
-    observer.observe(this.videoWrapEl);
+    this._visibilityObserver = observer;
+    observer.observe(this.playerEl);
   }
 
   _previewSource() {
@@ -352,7 +397,7 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _syncPreview() {
-    if (!this._previewVisible || document.hidden || this._playbackRequested) {
+    if (!this._cardVisible || document.hidden || this._playbackRequested) {
       this._stopPreview();
       return;
     }
@@ -399,34 +444,116 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _setupTransportControls() {
-    this.startVideoBtnEl.addEventListener('click', () => this._startPlayback());
-    this.playPauseBtnEl.addEventListener('click', () => {
-      if (this._playbackRequested) this._stopPlayback();
-      else this._startPlayback();
-    });
-    this.querySelector('#wave-skip-back').addEventListener('click', () => {
-      this.seekTo(this._playheadMs - 10000);
-    });
-    this.querySelector('#wave-skip-fwd').addEventListener('click', () => {
-      this.seekTo(this._playheadMs + 10000);
-    });
+    this.startVideoBtnEl.addEventListener('click', () => this._togglePlayback());
+    this.playPauseBtnEl.addEventListener('click', () => this._togglePlayback());
+    this.stopBtnEl.addEventListener('click', () => this._stopPlayback());
+    this.querySelector('#wave-skip-back').addEventListener('click', () => this._skip(-SEEK_STEP_MS));
+    this.querySelector('#wave-skip-fwd').addEventListener('click', () => this._skip(SEEK_STEP_MS));
     this.liveBtnEl.addEventListener('click', () => this.seekTo(Date.now(), { isLive: true }));
     this.querySelector('#wave-zoom-in').addEventListener('click', () => this._zoomBy(0.5, null));
     this.querySelector('#wave-zoom-out').addEventListener('click', () => this._zoomBy(2, null));
 
-    const muteBtn = this.querySelector('#wave-mute');
-    muteBtn.addEventListener('click', () => {
-      this.videoEl.muted = !this.videoEl.muted;
-      muteBtn.querySelector('ha-icon').setAttribute('icon', this.videoEl.muted ? 'mdi:volume-off' : 'mdi:volume-high');
-    });
+    this.muteBtnEl = this.querySelector('#wave-mute');
+    this.muteBtnEl.addEventListener('click', () => this._toggleMute());
 
-    this.querySelector('#wave-fullscreen').addEventListener('click', () => {
-      if (document.fullscreenElement) {
-        document.exitFullscreen();
-      } else if (this.videoWrapEl.requestFullscreen) {
-        this.videoWrapEl.requestFullscreen();
+    this.fullscreenBtnEl = this.querySelector('#wave-fullscreen');
+    this.fullscreenBtnEl.hidden = !this.playerEl.requestFullscreen;
+    this.fullscreenBtnEl.addEventListener('click', () => this._toggleFullscreen());
+    const { signal } = this._listeners;
+    document.addEventListener('fullscreenchange', () => {
+      const fullscreen = this.playerEl.matches(':fullscreen');
+      const label = fullscreen ? 'Vollbild verlassen' : 'Vollbild';
+      this.fullscreenBtnEl.title = `${label} (F)`;
+      this.fullscreenBtnEl.setAttribute('aria-label', label);
+      this.fullscreenBtnEl.querySelector('ha-icon').setAttribute('icon', fullscreen ? 'mdi:fullscreen-exit' : 'mdi:fullscreen');
+      if (fullscreen) this.playerEl.focus({ preventScroll: true });
+      this._showFullscreenControls();
+    }, { signal });
+    document.addEventListener('keydown', (event) => this._handleFullscreenKey(event), { signal });
+    const revealControls = () => {
+      if (this.playerEl.matches(':fullscreen')) this._showFullscreenControls();
+    };
+    this.playerEl.addEventListener('pointermove', revealControls, { signal });
+    this.playerEl.addEventListener('pointerdown', revealControls, { signal });
+    this.playerEl.addEventListener('click', (event) => {
+      if (event.detail > 0 && event.target.closest?.('button') && this.playerEl.matches(':fullscreen')) {
+        this.playerEl.focus({ preventScroll: true });
       }
-    });
+    }, { signal });
+  }
+
+  _toggleMute() {
+    this.videoEl.muted = !this.videoEl.muted;
+    this._syncMuteIcon();
+  }
+
+  _syncMuteIcon() {
+    const muted = this.videoEl.muted || this.videoEl.volume === 0;
+    this.muteBtnEl.querySelector('ha-icon').setAttribute('icon', muted ? 'mdi:volume-off' : 'mdi:volume-high');
+  }
+
+  async _toggleFullscreen() {
+    try {
+      if (this.playerEl.matches(':fullscreen')) await document.exitFullscreen();
+      else await this.playerEl.requestFullscreen?.();
+    } catch {
+      // The document or an embedding page can disallow fullscreen.
+    }
+  }
+
+  _showFullscreenControls() {
+    clearTimeout(this._fullscreenControlsTimer);
+    this._fullscreenControlsTimer = null;
+    this.playerEl.classList.remove('wwc-controls-hidden');
+    if (this.playerEl.matches(':fullscreen') && !this.videoEl.paused && !this._playbackPaused) {
+      this._fullscreenControlsTimer = setTimeout(() => {
+        this._fullscreenControlsTimer = null;
+        this.playerEl.classList.add('wwc-controls-hidden');
+      }, FULLSCREEN_CONTROLS_MS);
+    }
+  }
+
+  _handleFullscreenKey(event) {
+    if (!this.playerEl.matches(':fullscreen') || event.defaultPrevented || event.altKey ||
+        event.ctrlKey || event.metaKey) return;
+    const target = event.composedPath()[0];
+    if (target.isContentEditable || target.closest?.('input, textarea, select, [role="textbox"]')) return;
+    const key = event.key.toLowerCase();
+    if (key === ' ' && target.closest?.('button')) return;
+    if (![' ', 'k', 'arrowleft', 'arrowright', 'arrowup', 'arrowdown', 'm', 'f'].includes(key)) return;
+    event.preventDefault();
+    this._showFullscreenControls();
+    if (event.repeat) return;
+    switch (key) {
+      case ' ':
+      case 'k': this._togglePlayback(); break;
+      case 'arrowleft': this._skip(-SEEK_STEP_MS); break;
+      case 'arrowright': this._skip(SEEK_STEP_MS); break;
+      case 'arrowup':
+      case 'arrowdown':
+        this.videoEl.volume = Math.max(0, Math.min(1, this.videoEl.volume + (key === 'arrowup' ? 0.1 : -0.1)));
+        this.videoEl.muted = false;
+        this._syncMuteIcon();
+        break;
+      case 'm': this._toggleMute(); break;
+      case 'f': this._toggleFullscreen(); break;
+    }
+  }
+
+  _skip(deltaMs) {
+    if (this._isLive && deltaMs > 0) return;
+    const now = Date.now();
+    const target = (this._isLive ? now : this._playheadMs) + deltaMs;
+    if (this.playerEl.matches(':fullscreen')) {
+      clearTimeout(this._seekFeedbackTimer);
+      this.seekFeedbackEl.textContent = target >= now ? 'Live' : deltaMs < 0 ? '−10 s' : '+10 s';
+      this.seekFeedbackEl.hidden = false;
+      this._seekFeedbackTimer = setTimeout(() => {
+        this._seekFeedbackTimer = null;
+        this.seekFeedbackEl.hidden = true;
+      }, 800);
+    }
+    this.seekTo(Math.min(target, now), { isLive: target >= now });
   }
 
   _setupVideoZoom() {
@@ -536,10 +663,12 @@ class WisenetWaveCard extends HTMLElement {
   _setupVideoEvents() {
     const { signal } = this._listeners;
     this.videoEl.addEventListener('play', () => {
+      this._showFullscreenControls();
       this._startPlayheadLoop();
       this._startLoadWatchdog();
     }, { signal });
     this.videoEl.addEventListener('pause', () => {
+      this._showFullscreenControls();
       this._stopPlayheadLoop();
     }, { signal });
     this.videoEl.addEventListener('error', () => {
@@ -580,7 +709,8 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _startLoadWatchdog() {
-    if (this._loadWatchdogId !== null || !this._currentStreamUrl || !this._playbackRequested) return;
+    if (this._loadWatchdogId !== null || !this._currentStreamUrl ||
+        !this._playbackRequested || this._playbackPaused) return;
     const now = performance.now();
     this._playbackMonitor = {
       checkedAt: now,
@@ -594,6 +724,7 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _playVideo() {
+    if (!this._playbackRequested || this._playbackPaused) return;
     this._startLoadWatchdog();
     const monitor = this._playbackMonitor;
     this.videoEl.play().catch((error) => {
@@ -670,20 +801,25 @@ class WisenetWaveCard extends HTMLElement {
     this.videoEl.style.setProperty('pointer-events', 'none');
 
     if (this.liveBadgeEl) {
-      this.liveBadgeEl.style.display = isLive && this._playbackRequested ? 'flex' : 'none';
+      this.liveBadgeEl.style.display = isLive && this._playbackRequested && !this._playbackPaused ? 'flex' : 'none';
     }
 
-    const skipBackBtn = this.querySelector('#wave-skip-back');
     const skipFwdBtn = this.querySelector('#wave-skip-fwd');
-    skipBackBtn.disabled = isLive;
     skipFwdBtn.disabled = isLive;
-    const playbackLabel = this._playbackRequested ? 'Stream stoppen' : 'Stream starten';
-    this.videoWrapEl.classList.toggle('wwc-video-idle', !this._playbackRequested);
-    this.startVideoBtnEl.hidden = this._playbackRequested;
+    const playbackLabel = !this._playbackRequested ? 'Stream starten' :
+      this._playbackPaused ? 'Stream fortsetzen' : 'Stream pausieren';
+    const waiting = !this._playbackRequested || (this._playbackPaused && !this._currentStreamUrl);
+    this.videoWrapEl.classList.toggle('wwc-video-idle', waiting);
+    this.startVideoBtnEl.hidden = this._playbackRequested && !this._playbackPaused;
+    this.startVideoBtnEl.setAttribute('aria-label', this._playbackPaused ? 'Video fortsetzen' : 'Video starten');
+    this.startVideoBtnEl.title = this._playbackPaused ? 'Video fortsetzen' : 'Video starten';
+    this.stopBtnEl.hidden = !this._playbackRequested;
     this.playPauseBtnEl.setAttribute('title', playbackLabel);
     this.playPauseBtnEl.setAttribute('aria-label', playbackLabel);
-    this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', this._playbackRequested ? 'mdi:stop' : 'mdi:play');
+    this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon',
+      this._playbackRequested && !this._playbackPaused ? 'mdi:pause' : 'mdi:play');
     this._syncPreview();
+    this._showFullscreenControls();
   }
 
   _startPlayheadLoop() {
@@ -692,7 +828,7 @@ class WisenetWaveCard extends HTMLElement {
     const tick = (now) => {
       if (now - lastDraw >= PLAYHEAD_UPDATE_MS && this._streamStartMs != null && !this.videoEl.paused) {
         lastDraw = now;
-        if (this._isLive) {
+        if (this._isLive && this._followLiveTimeline) {
           const span = this._viewEnd - this._viewStart;
           const now = Date.now();
           this._viewEnd = now;
@@ -734,7 +870,10 @@ class WisenetWaveCard extends HTMLElement {
     window.addEventListener('mousemove', (ev) => {
       if (!this._dragState) return;
       const dx = ev.clientX - this._dragState.startX;
-      if (Math.abs(dx) > 3) this._dragState.moved = true;
+      if (Math.abs(dx) > 3) {
+        this._dragState.moved = true;
+        this._followLiveTimeline = false;
+      }
       const rect = canvas.getBoundingClientRect();
       const span = this._dragState.origEnd - this._dragState.origStart;
       const deltaMs = (dx / rect.width) * span;
@@ -777,7 +916,10 @@ class WisenetWaveCard extends HTMLElement {
       const rect = canvas.getBoundingClientRect();
       if (ev.touches.length === 1 && this._dragState) {
         const dx = ev.touches[0].clientX - this._dragState.startX;
-        if (Math.abs(dx) > 3) this._dragState.moved = true;
+        if (Math.abs(dx) > 3) {
+          this._dragState.moved = true;
+          this._followLiveTimeline = false;
+        }
         const span = this._dragState.origEnd - this._dragState.origStart;
         const deltaMs = (dx / rect.width) * span;
         this._viewStart = this._dragState.origStart - deltaMs;
@@ -785,6 +927,7 @@ class WisenetWaveCard extends HTMLElement {
         this._clampView();
         this._drawTimeline();
       } else if (ev.touches.length === 2 && this._pinchState) {
+        this._followLiveTimeline = false;
         const dist = this._touchDist(ev.touches);
         const factor = this._pinchState.startDist / Math.max(dist, 1);
         const span = this._pinchState.origEnd - this._pinchState.origStart;
@@ -841,6 +984,7 @@ class WisenetWaveCard extends HTMLElement {
   // factor < 1 = reinzoomen, factor > 1 = rauszoomen. anchorRatio (0..1):
   // Position im Canvas, die beim Zoom fix bleiben soll (null = Mitte).
   _zoomBy(factor, anchorRatio) {
+    this._followLiveTimeline = false;
     const span = this._viewEnd - this._viewStart;
     const ratio = anchorRatio == null ? 0.5 : anchorRatio;
     const anchorTime = this._viewStart + span * ratio;
@@ -878,9 +1022,26 @@ class WisenetWaveCard extends HTMLElement {
 
   // ---------- Daten laden ----------
 
+  _syncTimeline() {
+    const active = this._cardVisible && !document.hidden;
+    if (active === this._timelineActive) {
+      if (active && this._timelineWaitingForCamera && this.resolveCameraId()) this._scheduleFetch();
+      return;
+    }
+    this._timelineActive = active;
+    if (active) {
+      this._scheduleFetch();
+    } else {
+      clearTimeout(this._fetchDebounce);
+      clearTimeout(this._timelineRetryTimer);
+      this._fetchDebounce = null;
+      this._timelineRetryTimer = null;
+    }
+  }
+
   _scheduleFetch() {
     clearTimeout(this._fetchDebounce);
-    if (!this._playbackRequested) return;
+    if (!this._timelineActive) return;
     this._fetchDebounce = setTimeout(() => {
       this._fetchDebounce = null;
       this._fetchVisiblePeriods();
@@ -892,7 +1053,7 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _scheduleTimelineRetry(delay) {
-    if (!this._playbackRequested) return;
+    if (!this._timelineActive) return;
     const deadline = Date.now() + delay;
     if (this._timelineRetryTimer !== null && this._timelineRetryAt <= deadline) return;
     clearTimeout(this._timelineRetryTimer);
@@ -904,14 +1065,26 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   async _fetchVisiblePeriods() {
-    if (!this._playbackRequested) return;
+    if (!this._timelineActive) return;
     const { signal } = this._listeners;
     const camera = this._cameraServiceData();
+    this._timelineWaitingForCamera = !camera;
     if (!camera) return;
 
+    const now = Date.now();
+    if (this._isLive && this._followLiveTimeline && !this._dragState && !this._pinchState) {
+      const span = this._viewEnd - this._viewStart;
+      this._viewEnd = now;
+      this._viewStart = now - span;
+      if (!this._playbackRequested) {
+        this._playheadMs = now;
+        this._updateTimeLabel();
+      }
+      this._drawTimeline();
+    }
     const bufferMs = (this._viewEnd - this._viewStart) * 0.5;
     const from = this._viewStart - bufferMs;
-    const to = this._viewEnd + bufferMs;
+    const to = Math.min(now + 1, this._viewEnd + bufferMs);
     const dayMs = 24 * 60 * 60 * 1000;
     const requests = [];
     const keys = [];
@@ -920,9 +1093,10 @@ class WisenetWaveCard extends HTMLElement {
       const key = `${camera.camera_id}_${this._dayKey(dayStart)}`;
       keys.push(key);
       const cached = this._periodsCache.get(key);
-      if (this._pendingFetches.has(key) || (cached && !cached.retryAt)) continue;
-      if (cached?.retryAt > Date.now()) {
-        this._scheduleTimelineRetry(cached.retryAt - Date.now());
+      const fetchAt = cached?.retryAt ?? cached?.refreshAt;
+      if (this._pendingFetches.has(key) || (cached && fetchAt === undefined)) continue;
+      if (fetchAt > now) {
+        this._scheduleTimelineRetry(fetchAt - now);
         continue;
       }
       if (this._pendingFetches.size >= TIMELINE_REQUEST_LIMIT) {
@@ -934,7 +1108,7 @@ class WisenetWaveCard extends HTMLElement {
     }
     this._visibleTimelineKeys = keys;
     await Promise.all(requests);
-    if (signal.aborted) return;
+    if (signal.aborted || !this._timelineActive) return;
     if (hasMore) this._scheduleTimelineRetry(requests.length ? 0 : 1000);
     const hasError = this._visibleTimelineKeys.some((key) => this._periodsCache.get(key)?.retryAt);
     this.timelineErrorEl.innerText = hasError ? 'Zeitleiste vorübergehend unvollständig.' : '';
@@ -947,7 +1121,7 @@ class WisenetWaveCard extends HTMLElement {
         type: 'call_service',
         domain: 'wisenet_wave',
         service: 'get_timeline',
-        service_data: { ...camera, start_ms: start, end_ms: end },
+        service_data: { ...camera, start_ms: start, end_ms: Math.min(end, Date.now()) },
         return_response: true,
       });
       data = result?.response ?? { error: 'Leere Antwort' };
@@ -957,7 +1131,6 @@ class WisenetWaveCard extends HTMLElement {
     if (signal.aborted) return;
 
     this._pendingFetches.delete(key);
-    if (!this._playbackRequested) return;
     if (data.error) {
       console.warn('wisenet_wave: Zeitleistenabfrage fehlgeschlagen', data.error);
       const previous = this._periodsCache.get(key);
@@ -967,9 +1140,12 @@ class WisenetWaveCard extends HTMLElement {
       data.retryAt = Date.now() + retryDelay;
       data.retryDelay = retryDelay;
       this._scheduleTimelineRetry(retryDelay);
+    } else if (end > Date.now()) {
+      data.refreshAt = Date.now() + TIMELINE_REFRESH_MS;
+      this._scheduleTimelineRetry(TIMELINE_REFRESH_MS);
     }
     this._periodsCache.set(key, data);
-    this._drawTimeline();
+    if (this._timelineActive) this._drawTimeline();
   }
 
   // ---------- Zeichnen ----------
@@ -1109,7 +1285,40 @@ class WisenetWaveCard extends HTMLElement {
 
   _startPlayback() {
     this._playbackRequested = true;
+    this._playbackPaused = false;
     return this.seekTo(this._isLive ? Date.now() : this._playheadMs, { isLive: this._isLive });
+  }
+
+  _togglePlayback() {
+    if (!this._playbackRequested) return this._startPlayback();
+    if (this._playbackPaused) {
+      if (this._isLive || !this._currentStreamUrl || this.videoEl.error) return this._startPlayback();
+      this._playbackPaused = false;
+      this.hls?.startLoad(this.videoEl.currentTime);
+      this._playVideo();
+      this._syncVideoUi();
+      return;
+    }
+
+    this._playbackPaused = true;
+    if (this._streamMode === 'archive' && this._streamStartMs !== null) {
+      this._playheadMs = this._streamStartMs + this.videoEl.currentTime * 1000;
+    }
+    const needsRestart = this._hlsRetryTimer !== null || this.videoEl.error || this.videoEl.readyState < 2;
+    this._clearHlsRetry();
+    this._clearHlsRecoveryNotice();
+    this._clearLoadWatchdog();
+    if (needsRestart) {
+      this._activeStreamToken += 1;
+      this._waitingForCamera = false;
+      this._releasePlayer();
+    } else {
+      this.hls?.stopLoad();
+      this.videoEl.pause();
+    }
+    this._syncVideoUi();
+    this._updateTimeLabel();
+    this._drawTimeline();
   }
 
   _stopPlayback() {
@@ -1117,15 +1326,12 @@ class WisenetWaveCard extends HTMLElement {
       this._playheadMs = this._streamStartMs + this.videoEl.currentTime * 1000;
     }
     this._playbackRequested = false;
+    this._playbackPaused = false;
     this._waitingForCamera = false;
     this._activeStreamToken += 1;
     this._clearHlsRetry();
     this._clearHlsRecoveryNotice();
     this._releasePlayer();
-    clearTimeout(this._fetchDebounce);
-    clearTimeout(this._timelineRetryTimer);
-    this._fetchDebounce = null;
-    this._timelineRetryTimer = null;
     this.errorEl.innerText = '';
     this._syncVideoUi();
     this._updateTimeLabel();
@@ -1141,17 +1347,19 @@ class WisenetWaveCard extends HTMLElement {
     this.errorEl.innerText = '';
     this._playheadMs = timestampMs;
     this._isLive = options.isLive ?? (Math.abs(Date.now() - timestampMs) < 15000);
+    this._followLiveTimeline = this._isLive;
     this._streamMode = this._isLive ? 'live' : 'archive';
     if (this._isLive) {
       const span = this._viewEnd - this._viewStart;
       this._viewEnd = Date.now();
       this._viewStart = this._viewEnd - span;
     }
+    if (this._playbackPaused) this._releasePlayer();
     this._syncVideoUi();
     this._updateTimeLabel();
     this._drawTimeline();
-    if (!this._playbackRequested) return;
     this._scheduleFetch();
+    if (!this._playbackRequested || this._playbackPaused) return;
     await this._requestStream(timestampMs, this._streamMode, token);
   }
 
@@ -1208,7 +1416,7 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _queueStreamRetry(reason, token, cancelOnProgress = false) {
-    if (token !== this._activeStreamToken || !this._playbackRequested) return;
+    if (token !== this._activeStreamToken || !this._playbackRequested || this._playbackPaused) return;
     if (this._hlsRetryTimer !== null) {
       if (!cancelOnProgress) this._cancelRetryOnProgress = false;
       return;
@@ -1280,7 +1488,7 @@ class WisenetWaveCard extends HTMLElement {
         this._playVideo();
       });
       player.on(Hls.Events.ERROR, (_event, data) => {
-        if (!data.fatal || token !== this._activeStreamToken || this.hls !== player) return;
+        if (!data.fatal || token !== this._activeStreamToken || this.hls !== player || this._playbackPaused) return;
         console.warn('wisenet_wave: HLS-Wiedergabe unterbrochen', data.type, data.details);
         if (!triedMediaRecovery && data.type === Hls.ErrorTypes.MEDIA_ERROR &&
             this.videoEl.error?.code === MediaError.MEDIA_ERR_DECODE &&
@@ -1323,13 +1531,18 @@ class WisenetWaveCard extends HTMLElement {
     this._listeners.abort();
     this._listeners = null;
     this._playbackRequested = false;
+    this._playbackPaused = false;
     this._waitingForCamera = false;
     this._activeStreamToken += 1;
 
     this._canvasResizeObserver?.disconnect();
     this._canvasResizeObserver = null;
-    this._previewObserver?.disconnect();
-    this._previewObserver = null;
+    this._visibilityObserver?.disconnect();
+    this._visibilityObserver = null;
+    this._cardVisible = false;
+    this._timelineActive = false;
+    clearTimeout(this._fullscreenControlsTimer);
+    clearTimeout(this._seekFeedbackTimer);
     this._stopPreview();
     if (this._previewObjectUrl) URL.revokeObjectURL(this._previewObjectUrl);
     this._previewObjectUrl = null;
