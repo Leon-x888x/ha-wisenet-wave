@@ -12,13 +12,14 @@ Under **Settings → Dashboards → Resources**, edit the existing Wisenet WAVE
 card resource. Set its type to **JavaScript module** and use this URL:
 
 ```text
-/wisenet_wave_card/wisenet-wave-card.js?v=0.1.2
+/wisenet_wave_card/wisenet-wave-card.js?v=0.1.3
 ```
 
 Use a single resource for the card. If the old resource points to
 `/local/wisenet-wave-card.js`, replace it with the URL above to load the copy
-from the installed integration. Reload the dashboard. Current cards display
-**Video starten** before making any stream requests. The browser console shows
-`[wisenet-wave-card] Version 0.1.2 geladen` when the updated module loads.
+from the installed integration. Reload the dashboard. Visible cards show a
+snapshot that refreshes every 10 seconds while the stream is off. Use the
+play button over the snapshot to start playback. The browser console shows
+`[wisenet-wave-card] Version 0.1.3 geladen` when the updated module loads.
 
 ⚠️ DisclaimerThis is a private, unofficial project. It is not affiliated with, endorsed, or supported by Hanwha Vision or Home Assistant. All product names, logos, and brands (such as "Wisenet Wave" and "Home Assistant") are the property of their respective owners. Use this software at your own risk.

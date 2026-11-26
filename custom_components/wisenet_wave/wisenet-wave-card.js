@@ -1,4 +1,4 @@
-console.info('[wisenet-wave-card] Version 0.1.2 geladen');
+console.info('[wisenet-wave-card] Version 0.1.3 geladen');
 
 const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const HLS_RECOVERY_NOTICE_MS = 2500;
@@ -10,6 +10,8 @@ const PLAYHEAD_UPDATE_MS = 125;
 const PLAYBACK_CHECK_MS = 1000;
 const PLAYBACK_STALL_MS = 7000;
 const VIDEO_FRAME_STALL_MS = 12000;
+const PREVIEW_INTERVAL_MS = 10000;
+const PREVIEW_TIMEOUT_MS = 8000;
 let hlsLibraryPromise;
 
 function loadHlsLibrary() {
@@ -72,6 +74,10 @@ class WisenetWaveCard extends HTMLElement {
     this._streamMode = 'live';
     this._waitingForCamera = false;
     this._playbackRequested = false;
+    this._previewVisible = false;
+    this._previewTimer = null;
+    this._previewRequest = null;
+    this._previewObjectUrl = null;
     this._videoZoomIndex = 0;
     this._videoOffsetX = 0;
     this._videoOffsetY = 0;
@@ -125,14 +131,18 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-content { padding: 0 16px 16px; }
             .wwc-video-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 4px; overflow: hidden; }
             .wwc-video-wrap video { width: 100%; height: 100%; display: block; object-fit: contain; background: #000; }
+            .wwc-video-preview { display: none; position: absolute; inset: 0; pointer-events: none; }
+            .wwc-video-preview img { display: block; width: 100%; height: 100%; object-fit: contain; }
+            .wwc-video-idle .wwc-video-preview { display: block; }
             .wwc-video-start {
               position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-              display: flex; align-items: center; gap: 6px; padding: 10px 18px;
-              border: 0; border-radius: 8px; font: inherit; color: #fff;
-              background: #333; cursor: pointer;
+              display: grid; place-items: center; width: 56px; height: 56px;
+              border: 1px solid rgba(255,255,255,0.6); border-radius: 50%; color: #fff;
+              background: rgba(0,0,0,0.72); cursor: pointer;
             }
+            .wwc-video-start ha-icon { --mdc-icon-size: 32px; }
             .wwc-video-start[hidden] { display: none; }
-            .wwc-video-start:hover { background: #494949; }
+            .wwc-video-start:hover { background: rgba(0,0,0,0.88); }
             .wwc-video-start:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
             .wwc-video-wrap.wwc-video-pannable:not(.wwc-video-idle) { cursor: grab; touch-action: none; user-select: none; }
             .wwc-video-wrap.wwc-video-dragging { cursor: grabbing; }
@@ -199,8 +209,9 @@ class WisenetWaveCard extends HTMLElement {
           <div class="card-content wwc-content">
             <div class="wwc-video-wrap">
               <video id="wave-video" muted playsinline></video>
+              <div class="wwc-video-preview" aria-hidden="true"></div>
               <div class="wwc-live-badge" id="wave-live-badge"><span class="wwc-live-badge-dot"></span>LIVE</div>
-              <button type="button" class="wwc-video-start" id="wave-video-start"><ha-icon icon="mdi:play"></ha-icon>Video starten</button>
+              <button type="button" class="wwc-video-start" id="wave-video-start" aria-label="Video starten" title="Video starten"><ha-icon icon="mdi:play"></ha-icon></button>
               <div class="wwc-video-zoom" role="group" aria-label="Videozoom">
                 <button type="button" class="wwc-btn" id="wave-video-zoom-out" title="Video verkleinern" aria-label="Video verkleinern"><ha-icon icon="mdi:minus"></ha-icon></button>
                 <button type="button" class="wwc-btn wwc-video-zoom-reset" id="wave-video-zoom-reset" title="Videozoom zurücksetzen">1×</button>
@@ -243,6 +254,7 @@ class WisenetWaveCard extends HTMLElement {
       this.content = this.querySelector('.card-content');
       this.videoEl = this.querySelector('#wave-video');
       this.videoWrapEl = this.querySelector('.wwc-video-wrap');
+      this.previewEl = this.querySelector('.wwc-video-preview');
       this.errorEl = this.querySelector('#wave-error');
       this.timelineErrorEl = this.querySelector('#wave-timeline-error');
       this.canvasEl = this.querySelector('#wave-canvas');
@@ -257,6 +269,7 @@ class WisenetWaveCard extends HTMLElement {
       this._setupVideoZoom();
       this._setupTimelineInteraction();
       this._setupVideoEvents();
+      this._setupPreview();
       this._syncVideoUi();
 
       this._resizeCanvas();
@@ -269,6 +282,7 @@ class WisenetWaveCard extends HTMLElement {
         this._refreshVideoLayout();
       }, { signal });
       document.addEventListener('visibilitychange', () => {
+        this._syncPreview();
         if (document.visibilityState === 'visible') {
           this._refreshVideoLayout();
         }
@@ -305,6 +319,82 @@ class WisenetWaveCard extends HTMLElement {
 
     } else if (this._playbackRequested && this._waitingForCamera && this._cameraServiceData()) {
       this._startPlayback();
+    }
+    this._syncPreview();
+  }
+
+  _setupPreview() {
+    this._previewVisible = !window.IntersectionObserver;
+    if (!window.IntersectionObserver) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (this._previewObserver !== observer) return;
+      this._previewVisible = entry.isIntersecting;
+      this._syncPreview();
+    });
+    this._previewObserver = observer;
+    observer.observe(this.videoWrapEl);
+  }
+
+  _previewSource() {
+    const states = this._hass.states;
+    if (!states) return null;
+    const { entity, camera_id: cameraId, config_entry_id: entryId } = this.config;
+    const configured = entity && states[entity];
+    if (configured && (!cameraId || configured.attributes.wisenet_camera_id === cameraId) &&
+        (!entryId || configured.attributes.wisenet_entry_id === entryId)) {
+      return configured.attributes.entity_picture;
+    }
+    if (!cameraId) return null;
+    const matching = Object.values(states).filter((state) => state.entity_id.startsWith('camera.') &&
+      state.attributes.wisenet_camera_id === cameraId &&
+      (!entryId || state.attributes.wisenet_entry_id === entryId));
+    return matching.length === 1 ? matching[0].attributes.entity_picture : null;
+  }
+
+  _syncPreview() {
+    if (!this._previewVisible || document.hidden || this._playbackRequested) {
+      this._stopPreview();
+      return;
+    }
+    if (this._previewTimer !== null || !this._previewSource()) return;
+    this._refreshPreview();
+    this._previewTimer = setInterval(() => this._refreshPreview(), PREVIEW_INTERVAL_MS);
+  }
+
+  _stopPreview() {
+    clearInterval(this._previewTimer);
+    this._previewTimer = null;
+    this._previewRequest?.abort();
+    this._previewRequest = null;
+  }
+
+  async _refreshPreview() {
+    if (this._previewRequest) return;
+    const source = this._previewSource();
+    if (!source) return;
+    const request = new AbortController();
+    this._previewRequest = request;
+    const timeout = setTimeout(() => request.abort(), PREVIEW_TIMEOUT_MS);
+    let imageUrl;
+    try {
+      const response = await fetch(source, { cache: 'no-store', signal: request.signal });
+      if (!response.ok) return;
+      imageUrl = URL.createObjectURL(await response.blob());
+      const image = new Image();
+      image.alt = '';
+      image.src = imageUrl;
+      await image.decode();
+      if (request.signal.aborted) return;
+      this.previewEl.replaceChildren(image);
+      if (this._previewObjectUrl) URL.revokeObjectURL(this._previewObjectUrl);
+      this._previewObjectUrl = imageUrl;
+      imageUrl = null;
+    } catch {
+      // Keep the last successful image when a single snapshot fails.
+    } finally {
+      clearTimeout(timeout);
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      if (this._previewRequest === request) this._previewRequest = null;
     }
   }
 
@@ -593,6 +683,7 @@ class WisenetWaveCard extends HTMLElement {
     this.playPauseBtnEl.setAttribute('title', playbackLabel);
     this.playPauseBtnEl.setAttribute('aria-label', playbackLabel);
     this.playPauseBtnEl.querySelector('ha-icon').setAttribute('icon', this._playbackRequested ? 'mdi:stop' : 'mdi:play');
+    this._syncPreview();
   }
 
   _startPlayheadLoop() {
@@ -1237,6 +1328,11 @@ class WisenetWaveCard extends HTMLElement {
 
     this._canvasResizeObserver?.disconnect();
     this._canvasResizeObserver = null;
+    this._previewObserver?.disconnect();
+    this._previewObserver = null;
+    this._stopPreview();
+    if (this._previewObjectUrl) URL.revokeObjectURL(this._previewObjectUrl);
+    this._previewObjectUrl = null;
     this._clearHlsRetry();
     this._clearHlsRecoveryNotice();
     this._releasePlayer();
