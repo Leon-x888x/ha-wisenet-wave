@@ -1,10 +1,8 @@
-// Version-Marker: taucht in der Browser-Konsole auf. Wenn diese Zeile nach
-// einem Reload NICHT erscheint (oder eine ältere Versionsnummer zeigt),
-// läuft noch eine gecachte alte Datei - dann hilft nur ein Cache-Bust über
-// die Lovelace-Ressourcen-URL (z.B. "...wisenet-wave-card.js?v=X").
-console.info('[wisenet-wave-card] Version 2026-11-26-manual-play geladen');
+console.info('[wisenet-wave-card] Version 0.1.2 geladen');
 
 const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
+const HLS_RECOVERY_NOTICE_MS = 2500;
+const HLS_RECOVERY_NOTICE = 'Verbindung zum Stream wird wiederhergestellt …';
 const TIMELINE_RETRY_MS = 15000;
 const TIMELINE_REQUEST_LIMIT = 4;
 const VIDEO_ZOOM_LEVELS = [1, 1.5, 2, 3, 4];
@@ -66,6 +64,7 @@ class WisenetWaveCard extends HTMLElement {
     this._timelineRetryTimer = null;
     this._timelineRetryAt = 0;
     this._hlsRetryTimer = null;
+    this._hlsRecoveryNoticeTimer = null;
     this._hlsRetryCount = 0;
     this._activeStreamToken = (this._activeStreamToken ?? 0) + 1;
     this._currentStreamUrl = null;
@@ -546,11 +545,9 @@ class WisenetWaveCard extends HTMLElement {
     if (advanced && frameAdvanced) {
       if (this._hlsRetryTimer !== null && !this._cancelRetryOnProgress) return;
       this._clearHlsRetry();
+      this._clearHlsRecoveryNotice();
       monitor.stableSince ??= now;
       if (now - monitor.stableSince >= 10000) this._hlsRetryCount = 0;
-      if (this.errorEl.innerText.startsWith('HLS Fehler') || this.errorEl.innerText.startsWith('Stream vorübergehend')) {
-        this.errorEl.innerText = '';
-      }
     } else {
       monitor.stableSince = null;
     }
@@ -1032,6 +1029,7 @@ class WisenetWaveCard extends HTMLElement {
     this._waitingForCamera = false;
     this._activeStreamToken += 1;
     this._clearHlsRetry();
+    this._clearHlsRecoveryNotice();
     this._releasePlayer();
     clearTimeout(this._fetchDebounce);
     clearTimeout(this._timelineRetryTimer);
@@ -1045,6 +1043,7 @@ class WisenetWaveCard extends HTMLElement {
 
   async seekTo(timestampMs, options = {}) {
     this._clearHlsRetry();
+    this._clearHlsRecoveryNotice();
     this._hlsRetryCount = 0;
     const token = ++this._activeStreamToken;
 
@@ -1101,6 +1100,22 @@ class WisenetWaveCard extends HTMLElement {
     this._hlsRetryTimer = null;
   }
 
+  _showHlsRecoveryNotice(token) {
+    if (this._hlsRecoveryNoticeTimer !== null || this.errorEl.innerText === HLS_RECOVERY_NOTICE) return;
+    this._hlsRecoveryNoticeTimer = setTimeout(() => {
+      this._hlsRecoveryNoticeTimer = null;
+      if (token === this._activeStreamToken && this._playbackRequested) {
+        this.errorEl.innerText = HLS_RECOVERY_NOTICE;
+      }
+    }, HLS_RECOVERY_NOTICE_MS);
+  }
+
+  _clearHlsRecoveryNotice() {
+    clearTimeout(this._hlsRecoveryNoticeTimer);
+    this._hlsRecoveryNoticeTimer = null;
+    if (this.errorEl.innerText === HLS_RECOVERY_NOTICE) this.errorEl.innerText = '';
+  }
+
   _queueStreamRetry(reason, token, cancelOnProgress = false) {
     if (token !== this._activeStreamToken || !this._playbackRequested) return;
     if (this._hlsRetryTimer !== null) {
@@ -1117,7 +1132,7 @@ class WisenetWaveCard extends HTMLElement {
     const mode = this._streamMode;
     this._hlsRetryCount += 1;
     this._cancelRetryOnProgress = cancelOnProgress;
-    this.errorEl.innerText = `Stream vorübergehend nicht verfügbar, versuche erneut (${this._hlsRetryCount}/${HLS_RETRY_DELAYS.length})...`;
+    this._showHlsRecoveryNotice(token);
     this._hlsRetryTimer = setTimeout(() => {
       this._hlsRetryTimer = null;
       if (token !== this._activeStreamToken || !this._playbackRequested) return;
@@ -1223,6 +1238,7 @@ class WisenetWaveCard extends HTMLElement {
     this._canvasResizeObserver?.disconnect();
     this._canvasResizeObserver = null;
     this._clearHlsRetry();
+    this._clearHlsRecoveryNotice();
     this._releasePlayer();
     clearTimeout(this._fetchDebounce);
     clearTimeout(this._timelineRetryTimer);
