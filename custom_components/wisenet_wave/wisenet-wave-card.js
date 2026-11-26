@@ -1,4 +1,4 @@
-console.info('[wisenet-wave-card] Version 0.1.4 geladen');
+console.info('[wisenet-wave-card] Version 0.1.5 geladen');
 
 const HLS_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const HLS_RECOVERY_NOTICE_MS = 2500;
@@ -9,6 +9,8 @@ const TIMELINE_REFRESH_MS = 30000;
 const FULLSCREEN_CONTROLS_MS = 3000;
 const SEEK_STEP_MS = 10000;
 const VIDEO_ZOOM_LEVELS = [1, 1.5, 2, 3, 4];
+const MAX_VIDEO_ZOOM = VIDEO_ZOOM_LEVELS[VIDEO_ZOOM_LEVELS.length - 1];
+const VIDEO_ZOOM_FORMAT = new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 });
 const PLAYHEAD_UPDATE_MS = 125;
 const PLAYBACK_CHECK_MS = 1000;
 const PLAYBACK_STALL_MS = 7000;
@@ -87,7 +89,7 @@ class WisenetWaveCard extends HTMLElement {
     this._previewTimer = null;
     this._previewRequest = null;
     this._previewObjectUrl = null;
-    this._videoZoomIndex = 0;
+    this._videoZoom = 1;
     this._videoOffsetX = 0;
     this._videoOffsetY = 0;
     if (this.isConnected && this._hass) this.hass = this._hass;
@@ -176,7 +178,8 @@ class WisenetWaveCard extends HTMLElement {
             .wwc-video-start[hidden] { display: none; }
             .wwc-video-start:hover { background: rgba(0,0,0,0.88); }
             .wwc-video-start:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
-            .wwc-video-wrap.wwc-video-pannable:not(.wwc-video-idle) { cursor: grab; touch-action: none; user-select: none; }
+            .wwc-video-wrap:not(.wwc-video-idle) { touch-action: none; }
+            .wwc-video-wrap.wwc-video-pannable:not(.wwc-video-idle) { cursor: grab; user-select: none; }
             .wwc-video-wrap.wwc-video-dragging { cursor: grabbing; }
             .wwc-video-zoom {
               position: absolute; right: 8px; bottom: 8px; display: flex; align-items: center;
@@ -563,10 +566,20 @@ class WisenetWaveCard extends HTMLElement {
     const zoomOut = this.querySelector('#wave-video-zoom-out');
     const reset = this.querySelector('#wave-video-zoom-reset');
     this._videoZoomControls = { zoomIn, zoomOut, reset };
-    zoomIn.addEventListener('click', () => this._setVideoZoom(this._videoZoomIndex + 1), { signal });
-    zoomOut.addEventListener('click', () => this._setVideoZoom(this._videoZoomIndex - 1), { signal });
-    reset.addEventListener('click', () => this._setVideoZoom(0), { signal });
+    zoomIn.addEventListener('click', () => this._setVideoZoom(this._nextVideoZoom(1)), { signal });
+    zoomOut.addEventListener('click', () => this._setVideoZoom(this._nextVideoZoom(-1)), { signal });
+    reset.addEventListener('click', () => this._setVideoZoom(1), { signal });
     this.videoEl.addEventListener('resize', () => this._renderVideoZoom(), { signal });
+
+    const videoAnchors = (...points) => {
+      const { width, height } = this._videoImageSize();
+      const rect = wrap.getBoundingClientRect();
+      if (!width || !height || !rect.width || !rect.height) return null;
+      return points.map(({ x, y }) => ({
+        x: ((x - rect.left) / rect.width - 0.5) * wrap.clientWidth / width,
+        y: ((y - rect.top) / rect.height - 0.5) * wrap.clientHeight / height,
+      }));
+    };
 
     let wheelDelta = 0;
     let lastWheelAt = 0;
@@ -576,14 +589,13 @@ class WisenetWaveCard extends HTMLElement {
       const { deltaX, deltaY } = event;
       if (event.ctrlKey || event.metaKey || !deltaY || Math.abs(deltaX) > Math.abs(deltaY)) return;
       const step = deltaY < 0 ? 1 : -1;
-      const index = this._videoZoomIndex + step;
-      if (index < 0 || index >= VIDEO_ZOOM_LEVELS.length) {
+      const zoom = this._nextVideoZoom(step);
+      if (zoom === this._videoZoom) {
         wheelDelta = 0;
         return;
       }
-      const { width, height } = this._videoImageSize();
-      const rect = wrap.getBoundingClientRect();
-      if (!width || !height || !rect.width || !rect.height) return;
+      const anchors = videoAnchors({ x: event.clientX, y: event.clientY });
+      if (!anchors) return;
       event.preventDefault();
       const now = performance.now();
       if (now - lastWheelAt > 180 || Math.sign(wheelDelta) !== Math.sign(deltaY)) wheelDelta = 0;
@@ -591,43 +603,66 @@ class WisenetWaveCard extends HTMLElement {
       wheelDelta += deltaY * (mode === 1 ? 16 : mode === 2 ? wrap.clientHeight : 1);
       if (Math.abs(wheelDelta) < 40) return;
       wheelDelta = 0;
-      const x = ((event.clientX - rect.left) / rect.width - 0.5) * wrap.clientWidth / width;
-      const y = ((event.clientY - rect.top) / rect.height - 0.5) * wrap.clientHeight / height;
-      this._setVideoZoom(index, x, y);
+      this._setVideoZoom(zoom, anchors[0]);
     }, { passive: false, signal });
 
-    let drag = null;
+    const pointers = new Map();
+    const updateDragCursor = () => {
+      wrap.classList.toggle('wwc-video-dragging', pointers.size > 0 && this._videoZoom > 1);
+    };
     wrap.addEventListener('pointerdown', (event) => {
-      if (!this._playbackRequested || !this._videoZoomIndex || drag || event.button !== 0 ||
-          event.target.closest('.wwc-video-zoom')) return;
-      const { width, height } = this._videoImageSize();
-      if (!width || !height) return;
-      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, width, height };
+      if (!this._playbackRequested || event.button !== 0 || event.target.closest('button')) return;
+      const touch = event.pointerType === 'touch';
+      if (pointers.size >= 2 || (pointers.size && (!touch || !pointers.values().next().value.touch)) ||
+          (!touch && this._videoZoom === 1)) return;
+      pointers.set(event.pointerId, { x: event.clientX, y: event.clientY, touch });
       wrap.setPointerCapture(event.pointerId);
-      wrap.classList.add('wwc-video-dragging');
+      updateDragCursor();
     }, { signal });
     wrap.addEventListener('pointermove', (event) => {
-      if (drag?.id !== event.pointerId) return;
-      this._videoOffsetX += (event.clientX - drag.x) / drag.width;
-      this._videoOffsetY += (event.clientY - drag.y) / drag.height;
-      drag.x = event.clientX;
-      drag.y = event.clientY;
-      this._renderVideoZoom();
+      const previous = pointers.get(event.pointerId);
+      if (!previous || !this._playbackRequested) return;
+      const current = { ...previous, x: event.clientX, y: event.clientY };
+      pointers.set(event.pointerId, current);
+
+      let zoom = this._videoZoom;
+      let from = previous;
+      let to = current;
+      if (pointers.size === 2) {
+        const other = [...pointers.values()].find((point) => point !== current);
+        const before = Math.hypot(previous.x - other.x, previous.y - other.y);
+        const after = Math.hypot(current.x - other.x, current.y - other.y);
+        if (before >= 1) zoom *= after / before;
+        from = { x: (previous.x + other.x) / 2, y: (previous.y + other.y) / 2 };
+        to = { x: (current.x + other.x) / 2, y: (current.y + other.y) / 2 };
+      } else if (zoom === 1) {
+        return;
+      }
+      const anchors = videoAnchors(from, to);
+      if (anchors) this._setVideoZoom(zoom, ...anchors);
+      updateDragCursor();
     }, { signal });
-    wrap.addEventListener('lostpointercapture', (event) => {
-      if (drag?.id !== event.pointerId) return;
-      drag = null;
-      wrap.classList.remove('wwc-video-dragging');
-    }, { signal });
+    const releasePointer = (event) => {
+      if (pointers.delete(event.pointerId)) updateDragCursor();
+    };
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      wrap.addEventListener(type, releasePointer, { signal });
+    }
     this._renderVideoZoom();
   }
 
-  _setVideoZoom(index, anchorX = 0, anchorY = 0) {
-    const previous = VIDEO_ZOOM_LEVELS[this._videoZoomIndex];
-    this._videoZoomIndex = Math.max(0, Math.min(VIDEO_ZOOM_LEVELS.length - 1, index));
-    const ratio = VIDEO_ZOOM_LEVELS[this._videoZoomIndex] / previous;
-    this._videoOffsetX += (this._videoOffsetX - anchorX) * (ratio - 1);
-    this._videoOffsetY += (this._videoOffsetY - anchorY) * (ratio - 1);
+  _nextVideoZoom(direction) {
+    if (direction > 0) return VIDEO_ZOOM_LEVELS.find((level) => level > this._videoZoom + 0.0001) ?? MAX_VIDEO_ZOOM;
+    const index = VIDEO_ZOOM_LEVELS.findIndex((level) => level >= this._videoZoom - 0.0001);
+    return VIDEO_ZOOM_LEVELS[Math.max(0, index - 1)];
+  }
+
+  _setVideoZoom(zoom, from = { x: 0, y: 0 }, to = from) {
+    const previous = this._videoZoom;
+    this._videoZoom = Math.max(1, Math.min(MAX_VIDEO_ZOOM, zoom));
+    const ratio = this._videoZoom / previous;
+    this._videoOffsetX = (this._videoOffsetX - from.x) * ratio + to.x;
+    this._videoOffsetY = (this._videoOffsetY - from.y) * ratio + to.y;
     this._renderVideoZoom();
   }
 
@@ -640,14 +675,16 @@ class WisenetWaveCard extends HTMLElement {
   }
 
   _renderVideoZoom() {
-    const zoom = VIDEO_ZOOM_LEVELS[this._videoZoomIndex];
+    const zoom = this._videoZoom;
     const wrap = this.videoWrapEl;
     const { zoomIn, zoomOut, reset } = this._videoZoomControls;
-    const label = `${zoom.toLocaleString('de-DE')}×`;
-    zoomIn.disabled = this._videoZoomIndex === VIDEO_ZOOM_LEVELS.length - 1;
-    zoomOut.disabled = reset.disabled = this._videoZoomIndex === 0;
-    reset.textContent = label;
-    reset.setAttribute('aria-label', `Videozoom ${label}, zurücksetzen`);
+    const label = `${VIDEO_ZOOM_FORMAT.format(zoom)}×`;
+    zoomIn.disabled = zoom === MAX_VIDEO_ZOOM;
+    zoomOut.disabled = reset.disabled = zoom === 1;
+    if (reset.textContent !== label || !reset.hasAttribute('aria-label')) {
+      reset.textContent = label;
+      reset.setAttribute('aria-label', `Videozoom ${label}, zurücksetzen`);
+    }
     wrap.classList.toggle('wwc-video-pannable', zoom > 1);
 
     const { width, height } = this._videoImageSize();
